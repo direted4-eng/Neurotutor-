@@ -121,3 +121,31 @@ def due_today(limit: int = 20) -> list[dict]:
             (now, limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def pick_new(limit: int = 2, domain: str | None = None) -> list[dict]:
+    """Pick concepts that have never been reviewed at any Bloom level.
+
+    A "new" concept is one whose mastery rows all have last_review IS NULL
+    (or has no mastery rows at all). Ordered by concept id for stability.
+    """
+    sql = """
+        SELECT c.id AS concept_id, c.name, c.slug, c.summary, c.sources,
+               d.code AS domain, p.name AS parent
+        FROM concepts c
+        JOIN domains d ON d.id = c.domain_id
+        LEFT JOIN concepts p ON p.id = c.parent_id
+        WHERE NOT EXISTS (
+            SELECT 1 FROM mastery m
+            WHERE m.concept_id = c.id AND m.last_review IS NOT NULL
+        )
+    """
+    params: list = []
+    if domain:
+        sql += " AND d.code = ?"
+        params.append(domain)
+    sql += " ORDER BY c.id ASC LIMIT ?"
+    params.append(limit)
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]

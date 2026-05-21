@@ -8,7 +8,8 @@ from rich.table import Table
 
 from .db.store import init_db
 from .seed.load import seed_all
-from .session import plan_review, turn
+from .session import end as end_session
+from .session import plan_new, plan_review, start as start_session, turn
 
 app = typer.Typer(help="Neurotutor — нейроанатом-репетитор")
 
@@ -32,12 +33,35 @@ def due() -> None:
     print(t)
 
 
+@app.command(name="new-concepts")
+def new_concepts(limit: int = 5,
+                 domain: str = typer.Option("", help="anatomy|pathology|...")) -> None:
+    """Показать концепты, которые ещё ни разу не повторялись."""
+    rows = plan_new(limit=limit, domain=domain or None)
+    if not rows:
+        print("[yellow]Новых концептов не осталось — изучены все.[/]")
+        return
+    t = Table("concept", "domain", "parent", "summary")
+    for r in rows:
+        t.add_row(r["name"], r["domain"], r["parent"] or "—",
+                  (r["summary"] or "")[:60])
+    print(t)
+
+
 @app.command()
 def ask(mode: str = typer.Argument(..., help="diagnostic|review|new|case|osce|imaging"),
         message: str = typer.Argument(...),
-        persona: str = typer.Option("corvin", help="corvin|lin|plain")) -> None:
+        persona: str = typer.Option("corvin", help="corvin|lin|plain"),
+        no_persist: bool = typer.Option(
+            False, "--no-persist",
+            help="Не открывать сессию и не писать responses в БД")) -> None:
     """Один turn агента (без интерактивного цикла)."""
-    out = turn(mode, message, persona=persona)
+    sid = None if no_persist else start_session(mode, notes="cli ask")
+    try:
+        out = turn(mode, message, persona=persona, session_id=sid)
+    finally:
+        if sid is not None:
+            end_session(sid)
     print(f"[bold]{out['role']} / {out['persona']}[/]: {out['reply']}")
     for step in out["trace"]:
         print(f"  → tool {step['tool']} args={step['args']}")
