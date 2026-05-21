@@ -1,0 +1,110 @@
+[
+  {
+    "code": "gcs",
+    "title": "Glasgow Coma Scale",
+    "domain": "clinical",
+    "source": "Teasdale & Jennett 1974",
+    "payload": {
+      "eye": {"4": "spontaneous", "3": "to speech", "2": "to pain", "1": "none"},
+      "verbal": {"5": "oriented", "4": "confused", "3": "inappropriate words",
+                 "2": "incomprehensible", "1": "none"},
+      "motor": {"6": "obeys", "5": "localizes", "4": "withdraws",
+                "3": "flexion", "2": "extension", "1": "none"},
+      "interpretation": {"mild": "13-15", "moderate": "9-12", "severe": "3-8"}
+    }
+  },
+  {
+    "code": "hunt_hess",
+    "title": "Hunt-Hess Grade (aSAH)",
+    "domain": "clinical",
+    "source": "Hunt & Hess 1968",
+    "payload": {
+      "1": "asymptomatic / mild headache",
+      "2": "moderate–severe headache, nuchal rigidity, no deficit beyond CN",
+      "3": "drowsiness, confusion, mild focal deficit",
+      "4": "stupor, moderate–severe hemiparesis, early decerebration",
+      "5": "deep coma, decerebrate posturing, moribund"
+    }
+  },
+  {
+    "code": "fisher",
+    "title": "Fisher Grade (CT SAH)",
+    "domain": "radiology",
+    "source": "Fisher 1980",
+    "payload": {
+      "1": "no SAH detected",
+      "2": "diffuse / thin <1mm SAH",
+      "3": "localized clot or thick >1mm SAH",
+      "4": "ICH or IVH with diffuse/no SAH"
+    }
+  },
+  {
+    "code": "mfisher",
+    "title": "Modified Fisher",
+    "domain": "radiology",
+    "source": "Frontera 2006",
+    "payload": {
+      "0": "no SAH, no IVH",
+      "1": "thin SAH, no IVH",
+      "2": "thin SAH with IVH",
+      "3": "thick SAH, no IVH",
+      "4": "thick SAH with IVH"
+    }
+  },
+  {
+    "code": "spetzler_martin",
+    "title": "Spetzler-Martin AVM Grade",
+    "domain": "clinical",
+    "source": "Spetzler-Martin 1986",
+    "payload": {
+      "size": {"<3cm": 1, "3-6cm": 2, ">6cm": 3},
+      "eloquence": {"non-eloquent": 0, "eloquent": 1},
+      "venous_drainage": {"superficial only": 0, "deep": 1},
+      "grade": "sum 1..5"
+    }
+  },
+  {
+    "code": "who_cns_2021",
+    "title": "WHO Classification of CNS Tumors, 5th ed (2021)",
+    "domain": "pathology",
+    "source": "WHO 2021",
+    "payload": {
+      "principle": "integrated diagnosis: histology + molecular",
+      "key_molecular": ["IDH1/2", "1p/19q codeletion", "MGMT methylation",
+                        "H3 K27M", "H3 G34", "BRAF V600E", "TERT"],
+      "examples": {
+        "astrocytoma_IDHmut": "grades 2-4",
+        "oligodendroglioma_IDHmut_1p19qcodel": "grades 2-3",
+        "glioblastoma_IDHwt": "grade 4",
+        "diffuse_midline_glioma_H3K27altered": "grade 4"
+      }
+    }
+  },
+  {
+    "code": "asia",
+    "title": "ASIA Impairment Scale",
+    "domain": "clinical",
+    "source": "ASIA/ISCoS",
+    "payload": {
+      "A": "complete: no motor/sensory in S4-S5",
+      "B": "sensory incomplete",
+      "C": "motor incomplete, >half key muscles <3",
+      "D": "motor incomplete, >half key muscles ≥3",
+      "E": "normal"
+    }
+  },
+  {
+    "code": "house_brackmann",
+    "title": "House-Brackmann Facial Nerve Grading",
+    "domain": "clinical",
+    "source": "House & Brackmann 1985",
+    "payload": {
+      "I": "normal",
+      "II": "slight weakness on close inspection",
+      "III": "obvious but not disfiguring weakness, complete eye closure",
+      "IV": "obvious disfiguring weakness, incomplete eye closure",
+      "V": "barely perceptible motion",
+      "VI": "no movement"
+    }
+  }
+]
