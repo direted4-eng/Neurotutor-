@@ -9,6 +9,7 @@ import json
 import logging
 
 from ..llm.minimax import MiniMaxClient, extract_text, extract_tool_calls
+from .persona import DEFAULT_PERSONA, PERSONAS, compose
 from .roles import ROLES, Role
 from .tools import TOOLS, schemas_for
 
@@ -22,11 +23,14 @@ def run_turn(
     user_message: str,
     *,
     history: list[dict] | None = None,
+    persona: str = DEFAULT_PERSONA,
 ) -> dict:
     role: Role = ROLES[role_name]
+    pers = PERSONAS.get(persona, PERSONAS[DEFAULT_PERSONA])
     tools = schemas_for(role.tools)
 
-    messages: list[dict] = [{"role": "system", "content": role.system}]
+    messages: list[dict] = [{"role": "system",
+                             "content": compose(role.system, pers)}]
     if history:
         messages.extend(history)
     messages.append({"role": "user", "content": user_message})
@@ -39,7 +43,10 @@ def run_turn(
             calls = extract_tool_calls(resp)
             if not calls:
                 text = extract_text(resp)
-                return {"role": role.name, "reply": text, "trace": trace,
+                if pers.signature and not text.rstrip().endswith(pers.signature):
+                    text = f"{text.rstrip()}\n\n{pers.signature}"
+                return {"role": role.name, "persona": pers.code,
+                        "reply": text, "trace": trace,
                         "messages": messages + [
                             {"role": "assistant", "content": text}]}
 

@@ -34,12 +34,23 @@ def due() -> None:
 
 @app.command()
 def ask(mode: str = typer.Argument(..., help="diagnostic|review|new|case|osce|imaging"),
-        message: str = typer.Argument(...)) -> None:
+        message: str = typer.Argument(...),
+        persona: str = typer.Option("corvin", help="corvin|lin|plain")) -> None:
     """Один turn агента (без интерактивного цикла)."""
-    out = turn(mode, message)
-    print(f"[bold]{out['role']}[/]: {out['reply']}")
+    out = turn(mode, message, persona=persona)
+    print(f"[bold]{out['role']} / {out['persona']}[/]: {out['reply']}")
     for step in out["trace"]:
         print(f"  → tool {step['tool']} args={step['args']}")
+
+
+@app.command()
+def personas() -> None:
+    """Список доступных персонажей."""
+    from .agent.persona import PERSONAS
+    t = Table("code", "name", "signature")
+    for p in PERSONAS.values():
+        t.add_row(p.code, p.name, p.signature or "—")
+    print(t)
 
 
 @app.command()

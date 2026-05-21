@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Iterator
 
 from .agent.orchestrator import run_turn
+from .agent.persona import DEFAULT_PERSONA
 from .db.store import connect
 from .fsrs.scheduler import due_today
 
@@ -50,9 +51,10 @@ def plan_review() -> list[dict]:
 
 
 def turn(mode: str, user_message: str,
-         history: list[dict] | None = None) -> dict:
+         history: list[dict] | None = None,
+         persona: str = DEFAULT_PERSONA) -> dict:
     role = ROLE_BY_MODE.get(mode, "anatomist")
-    return run_turn(role, user_message, history=history)
+    return run_turn(role, user_message, history=history, persona=persona)
 
 
 def interactive(mode: str) -> Iterator[dict]:
