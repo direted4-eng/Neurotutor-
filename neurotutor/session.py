@@ -79,15 +79,19 @@ def _persist_responses(session_id: int, role: str, trace: list[dict]) -> int:
     if not graded:
         return 0
 
-    fsrs_by_concept: dict[int, int] = {}
+    # Mastery is tracked per (concept_id, bloom_level); key the rating map
+    # by the same tuple, otherwise a single turn that exercises one concept
+    # across multiple Bloom levels will overwrite earlier ratings.
+    fsrs_by_pair: dict[tuple[int, int], int] = {}
     for s in trace:
         if s["tool"] != "schedule_fsrs":
             continue
         args = s.get("args") or {}
         cid = args.get("concept_id")
+        bl = args.get("bloom_level")
         rating = args.get("rating")
-        if cid is not None and rating is not None:
-            fsrs_by_concept[cid] = rating
+        if cid is not None and bl is not None and rating is not None:
+            fsrs_by_pair[(cid, bl)] = rating
 
     written = 0
     with connect() as conn:
@@ -112,7 +116,7 @@ def _persist_responses(session_id: int, role: str, trace: list[dict]) -> int:
                         args.get("prompt", ""),
                         args.get("answer", ""),
                         grade,
-                        fsrs_by_concept.get(concept_id),
+                        fsrs_by_pair.get((concept_id, bloom)),
                         json.dumps(breakdown, ensure_ascii=False)
                             if breakdown is not None else None,
                     ),
@@ -139,17 +143,23 @@ def turn(mode: str, user_message: str,
 
 
 def interactive(mode: str) -> Iterator[dict]:
-    """Generator: yields agent replies; send user input via .send()."""
+    """Generator: yields agent replies; send user input via .send().
+
+    One yield per round-trip — the caller does `next(gen)` once to receive
+    the initial `awaiting` payload, then `.send(msg)` to deliver each user
+    message and receive the corresponding reply.
+    """
     history: list[dict] = []
     sid = start(mode)
     try:
+        out: dict = {"session_id": sid, "awaiting": "user"}
         while True:
-            user = (yield {"session_id": sid, "awaiting": "user"})
+            user = (yield out)
             if user in (None, "/quit"):
                 return
             result = turn(mode, user, history=history, session_id=sid)
             history = result["messages"][1:]  # drop system; agent re-adds it
-            yield {"session_id": sid, "reply": result["reply"],
+            out = {"session_id": sid, "reply": result["reply"],
                    "trace": result["trace"]}
     finally:
         end(sid)

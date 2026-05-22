@@ -7,3 +7,4 @@ rich>=13.7
 numpy>=1.26
 pypdf>=4.2
 beautifulsoup4>=4.12
+lxml>=4.9

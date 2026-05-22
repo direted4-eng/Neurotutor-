@@ -14,7 +14,9 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
 def search(query: str, *, source: str | None = None, k: int = 5) -> list[dict]:
     client = MiniMaxClient()
     try:
-        qvec = np.asarray(client.embed([query])[0], dtype=np.float32)
+        qvec = np.asarray(
+            client.embed([query], type_="query")[0], dtype=np.float32
+        )
     finally:
         client.close()
 

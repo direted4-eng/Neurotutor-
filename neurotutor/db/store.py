@@ -11,15 +11,34 @@ from ..config import SETTINGS
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
-def connect(db_path: Path | None = None) -> sqlite3.Connection:
+def _open(db_path: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path or SETTINGS.db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
+@contextmanager
+def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
+    """Open a SQLite connection that auto-closes on context exit.
+
+    `sqlite3.Connection`'s own context manager only commits/rolls back —
+    it does not close the connection. With WAL enabled (see schema.sql)
+    that leaks .wal/.shm handles until GC. Wrap callers in `with connect()`.
+    """
+    conn = _open(db_path)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def init_db(db_path: Path | None = None) -> None:
-    conn = connect(db_path)
+    conn = _open(db_path)
     try:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         conn.commit()
@@ -30,7 +49,7 @@ def init_db(db_path: Path | None = None) -> None:
 
 @contextmanager
 def cursor() -> Iterator[sqlite3.Cursor]:
-    conn = connect()
+    conn = _open()
     try:
         yield conn.cursor()
         conn.commit()

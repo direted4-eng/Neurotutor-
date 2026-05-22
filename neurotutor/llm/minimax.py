@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import mimetypes
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -28,6 +29,10 @@ class MiniMaxClient:
             },
             timeout=timeout,
         )
+        self._params: dict[str, str] = (
+            {"GroupId": SETTINGS.minimax_group_id}
+            if SETTINGS.minimax_group_id else {}
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -48,7 +53,9 @@ class MiniMaxClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        r = self._client.post("/text/chatcompletion_v2", json=payload)
+        r = self._client.post(
+            "/text/chatcompletion_v2", json=payload, params=self._params or None
+        )
         r.raise_for_status()
         return r.json()
 
@@ -60,32 +67,44 @@ class MiniMaxClient:
         temperature: float = 0.1,
     ) -> dict:
         b64 = base64.b64encode(image_path.read_bytes()).decode()
-        # inject image into the last user message
-        msgs = list(messages)
-        last = msgs[-1]
+        mime = mimetypes.guess_type(str(image_path))[0] or "image/png"
+        data_url = f"data:{mime};base64,{b64}"
+
+        # build fresh outer list AND fresh last-message dict so the caller's
+        # objects are never mutated
+        msgs = list(messages[:-1])
+        last = dict(messages[-1])
         last_content = last.get("content")
         if isinstance(last_content, str):
             last["content"] = [
                 {"type": "text", "text": last_content},
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                {"type": "image_url", "image_url": {"url": data_url}},
             ]
         else:
-            last_content.append(
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/png;base64,{b64}"}}
-            )
-        del b64  # free immediately
+            last["content"] = list(last_content or []) + [
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]
+        msgs.append(last)
+        del b64, data_url  # free immediately
         return self.chat(msgs, model=SETTINGS.vision_model, temperature=temperature)
 
-    def embed(self, texts: Iterable[str]) -> list[list[float]]:
+    def embed(
+        self, texts: Iterable[str], *, type_: str = "db"
+    ) -> list[list[float]]:
+        """Embed texts.
+
+        MiniMax embo-01 is asymmetric: pass type_='db' when indexing
+        passages, type_='query' when embedding user queries. Mixing types
+        silently degrades cosine similarity.
+        """
         r = self._client.post(
             "/embeddings",
             json={
                 "model": SETTINGS.embed_model,
                 "texts": list(texts),
-                "type": "db",
+                "type": type_,
             },
+            params=self._params or None,
         )
         r.raise_for_status()
         data = r.json()

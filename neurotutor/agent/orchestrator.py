@@ -70,7 +70,7 @@ def run_turn(
                     "tool_call_id": call["id"],
                     "content": json.dumps(result, ensure_ascii=False),
                 })
-        return {"role": role.name,
+        return {"role": role.name, "persona": pers.code,
                 "reply": "[max tool-call steps reached]",
                 "trace": trace, "messages": messages}
     finally:

@@ -11,7 +11,9 @@ JSON-serializable dict. The orchestrator routes by tool name.
 from __future__ import annotations
 
 import json
+import logging
 import random
+import re
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,32 @@ from ..db.store import connect
 from ..fsrs import scheduler as fsrs_sched
 from ..rag import retriever as rag_retriever
 from ..rag import sources as med_sources
+
+log = logging.getLogger(__name__)
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.S)
+
+
+def _parse_json_loose(text: str) -> dict | None:
+    """Parse JSON that may be wrapped in ```json fences or have leading prose."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    m = _JSON_FENCE_RE.search(text)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+    return None
 
 
 # ------------------------- schemas (OpenAI-style) -------------------------
@@ -299,7 +327,8 @@ def grade_answer(
     try:
         sys = (
             "Ты строгий экзаменатор по нейрохирургии. Оцени ответ по критериям. "
-            "Верни JSON: {\"score\": 0..1, \"breakdown\": {criterion: 0..1}, "
+            "Верни ТОЛЬКО сырой JSON, без markdown, без ``` блоков, без пояснений. "
+            "Формат: {\"score\": 0..1, \"breakdown\": {criterion: 0..1}, "
             "\"feedback\": str, \"suggested_rating\": 1..4}. "
             "1=again, 2=hard, 3=good, 4=easy."
         )
@@ -314,11 +343,11 @@ def grade_answer(
     finally:
         client.close()
 
-    try:
-        result = json.loads(text)
-    except json.JSONDecodeError:
+    result = _parse_json_loose(text)
+    if result is None:
+        log.warning("grade_answer: failed to parse JSON; raw response: %r", text[:500])
         result = {"score": 0.0, "breakdown": {}, "feedback": text,
-                  "suggested_rating": 1}
+                  "suggested_rating": 1, "parse_error": True}
     result["concept_id"] = concept_id
     result["bloom_level"] = bloom_level
     return result
