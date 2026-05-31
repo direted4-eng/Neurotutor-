@@ -1,0 +1,16 @@
+[Unit]
+Description=NeuroTutor Telegram bot (drill loop, long-poll)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/neurotutor
+ExecStart=/root/neurotutor/venv/bin/python tg_handler.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/root/neurotutor/data/bot.log
+StandardError=append:/root/neurotutor/data/bot.log
+
+[Install]
+WantedBy=multi-user.target

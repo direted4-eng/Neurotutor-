@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS mastery (
     next_review     TIMESTAMP,
     review_count    INTEGER NOT NULL DEFAULT 0,
     lapses          INTEGER NOT NULL DEFAULT 0,
+    card_json       TEXT,                        -- full FSRS Card state (v6 Card.to_json)
     PRIMARY KEY (concept_id, bloom_level)
 );
 
@@ -114,3 +115,18 @@ CREATE TABLE IF NOT EXISTS rag_chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_rag_source ON rag_chunks(source);
+
+-- Questions pushed to the student (e.g. morning drill via Telegram) that are
+-- awaiting an answer. One open row per question; answered_at set once graded.
+CREATE TABLE IF NOT EXISTS pending_questions (
+    id          INTEGER PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    concept_id  INTEGER REFERENCES concepts(id) ON DELETE CASCADE,
+    bloom_level INTEGER NOT NULL DEFAULT 1,
+    prompt      TEXT NOT NULL,
+    rubric      TEXT,                              -- JSON: criteria for grade_answer
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    answered_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_user ON pending_questions(user_id, answered_at);

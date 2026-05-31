@@ -198,6 +198,29 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "radiopaedia_search",
+            "description": "Search Radiopaedia for radiology cases with real "
+                           "CT/MRI/angio images. Returns title, URL, image_url, "
+                           "modality. Use in imaging mode or when the student "
+                           "needs a visual example of a finding.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string",
+                              "description": "e.g. 'circle of willis MRI', "
+                              "'subarachnoid hemorrhage CT', 'glioblastoma'"},
+                    "max_results": {"type": "integer", "default": 3},
+                    "scope": {"type": "string",
+                              "enum": ["cases", "articles", "all"],
+                              "default": "cases"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -373,6 +396,12 @@ def pubmed_search(query: str, max_results: int = 5,
         query, max_results=max_results, filter_=filter)}
 
 
+def radiopaedia_search(query: str, max_results: int = 3,
+                       scope: str = "cases") -> dict:
+    return {"results": med_sources.radiopaedia_search(
+        query, max_results=max_results, scope=scope)}
+
+
 TOOLS: dict[str, Any] = {
     "query_anatomy": query_anatomy,
     "interpret_imaging": interpret_imaging,
@@ -382,6 +411,7 @@ TOOLS: dict[str, Any] = {
     "schedule_fsrs": schedule_fsrs,
     "rag_search": rag_search,
     "pubmed_search": pubmed_search,
+    "radiopaedia_search": radiopaedia_search,
 }
 
 

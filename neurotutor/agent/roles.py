@@ -62,7 +62,7 @@ RADIOLOGIST = Role(
         "изображения по одному, не накапливай в памяти."
     ),
     tools=("interpret_imaging", "lookup_classification", "grade_answer",
-           "schedule_fsrs", "rag_search"),
+           "schedule_fsrs", "rag_search", "radiopaedia_search"),
 )
 
 EXAMINER = Role(

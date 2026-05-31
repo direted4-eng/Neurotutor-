@@ -1,0 +1,13 @@
+# NeuroTutor scheduled jobs.
+# Server timezone is UTC; user is Moscow (MSK = UTC+3). Times below are UTC,
+# with the Moscow equivalent in the comment.
+
+# Morning drill: recall (spaced repetition) + proactive scenarios
+# (cases, emergencies, intraop crises, operative steps).  07:00 MSK
+0 4 * * * cd /root/neurotutor && venv/bin/python tg_handler.py --drill 3 >> data/cron.log 2>&1
+
+# PubMed digest: recent operative-neurosurgery papers, last 14 days.  07:05 MSK
+5 4 * * * cd /root/neurotutor && venv/bin/python tg_handler.py --digest 14 >> data/cron.log 2>&1
+
+# Weekly competency report (gaps, weak spots, trend).  Sunday 19:00 MSK
+0 16 * * 0 cd /root/neurotutor && venv/bin/python tg_handler.py --report >> data/cron.log 2>&1

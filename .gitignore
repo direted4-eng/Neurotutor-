@@ -1,8 +1,10 @@
 __pycache__/
 *.py[cod]
 .venv/
+venv/
 .env
 data/
+*.log
 *.sqlite
 *.sqlite-journal
 .pytest_cache/

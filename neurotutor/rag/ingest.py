@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,9 @@ log = logging.getLogger(__name__)
 
 TARGET_TOKENS = 600
 OVERLAP = 120
+BATCH_SIZE = 16          # smaller batches — easier on RPM limits
+BATCH_DELAY = 2.0        # seconds between embed batches
+RETRY_DELAYS = (5, 15, 30, 60)  # backoff on rate-limit
 
 
 def _approx_tokens(text: str) -> int:
@@ -49,7 +53,7 @@ def _split_into_chunks(text: str) -> list[str]:
         buf_tokens += t
     if buf:
         chunks.append(" ".join(buf))
-    return chunks
+    return [c for c in chunks if c.strip()]
 
 
 def _extract_pdf(path: Path) -> str:
@@ -58,9 +62,23 @@ def _extract_pdf(path: Path) -> str:
     return "\n\n".join((page.extract_text() or "") for page in reader.pages)
 
 
+def _embed_with_retry(client: MiniMaxClient, texts: list[str]) -> list[list[float]]:
+    """Embed with exponential backoff on rate-limit (status_code 1002)."""
+    for attempt, wait in enumerate((*RETRY_DELAYS, None)):
+        result = client.embed(texts)
+        if result:
+            return result
+        # empty result = rate-limit or transient error
+        if wait is None:
+            raise RuntimeError(f"embed failed after {len(RETRY_DELAYS)+1} retries")
+        log.warning("embed returned empty (rate limit?), retry in %ds", wait)
+        time.sleep(wait)
+    return []  # unreachable
+
+
 def ingest_pdf(path: Path, source: str, ref: str | None = None,
                title: str | None = None) -> int:
-    """Ingest one PDF. Returns chunk count."""
+    """Ingest one PDF. Returns number of chunks inserted."""
     text = _extract_pdf(path)
     chunks = _split_into_chunks(text)
     log.info("ingesting %s: %d chunks", path.name, len(chunks))
@@ -68,12 +86,10 @@ def ingest_pdf(path: Path, source: str, ref: str | None = None,
     client = MiniMaxClient()
     inserted = 0
     try:
-        # Embed in batches of 32 to stay within memory/quotas.
-        batch = 32
         with connect() as conn:
-            for i in range(0, len(chunks), batch):
-                part = chunks[i:i + batch]
-                vectors = client.embed(part)
+            for i in range(0, len(chunks), BATCH_SIZE):
+                part = chunks[i:i + BATCH_SIZE]
+                vectors = _embed_with_retry(client, part)
                 for chunk, vec in zip(part, vectors):
                     blob = np.asarray(vec, dtype=np.float32).tobytes()
                     conn.execute(
@@ -84,7 +100,11 @@ def ingest_pdf(path: Path, source: str, ref: str | None = None,
                          _approx_tokens(chunk), blob),
                     )
                     inserted += 1
-            conn.commit()
+                conn.commit()  # commit per batch — resumable on crash
+                if i + BATCH_SIZE < len(chunks):
+                    time.sleep(BATCH_DELAY)
+                log.info("  %d/%d chunks done", min(i + BATCH_SIZE, len(chunks)),
+                         len(chunks))
     finally:
         client.close()
     return inserted

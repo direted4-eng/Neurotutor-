@@ -1,45 +1,70 @@
+"""RAG retrieval over the 13-book neurosurgery corpus.
+
+The corpus lives in a Qdrant collection (`neurosurgery`, 30k+ chunks,
+`paraphrase-multilingual-MiniLM-L12-v2`, 384-dim cosine). The model +
+qdrant client are heavy and already wired up in the workspace-tutor
+toolchain, so instead of pulling torch into this venv we shell out to the
+proven query script and isolate its memory in a short-lived subprocess.
+
+Returns the same contract the agent's `rag_search` tool expects:
+    [{id, source, ref, title, text, score}, ...]
+"""
 from __future__ import annotations
 
-import numpy as np
+import json
+import logging
+import subprocess
 
-from ..db.store import connect
-from ..llm.minimax import MiniMaxClient
+log = logging.getLogger(__name__)
 
-
-def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
-    return float(np.dot(a, b) / denom)
+# System python has sentence-transformers + qdrant access; the venv does not.
+_QUERY_PY = "/root/.openclaw/workspace-tutor/scripts/rag_query.py"
+_PYTHON = "/usr/bin/python3"
+_COLLECTION = "neurosurgery"
 
 
 def search(query: str, *, source: str | None = None, k: int = 5) -> list[dict]:
-    client = MiniMaxClient()
+    # Over-fetch when filtering by source so post-filter still yields ~k hits.
+    limit = k * 4 if source else k
     try:
-        qvec = np.asarray(
-            client.embed([query], type_="query")[0], dtype=np.float32
+        proc = subprocess.run(
+            [_PYTHON, _QUERY_PY, "--collection", _COLLECTION,
+             "--limit", str(limit), query],
+            capture_output=True, text=True, timeout=60,
         )
-    finally:
-        client.close()
+    except subprocess.TimeoutExpired:
+        log.warning("rag_query timed out for %r", query)
+        return []
+    except Exception:
+        log.exception("rag_query failed to launch")
+        return []
 
-    sql = "SELECT id, source, ref, title, text, embedding FROM rag_chunks"
-    params: list = []
-    if source:
-        sql += " WHERE source = ?"
-        params.append(source)
+    if proc.returncode != 0:
+        # rag_query.py exits 1 with {"error": ...} on no hits — not fatal.
+        log.info("rag_query rc=%s: %s", proc.returncode, proc.stderr.strip()[:200])
+        return []
 
-    scored: list[tuple[float, dict]] = []
-    with connect() as conn:
-        for row in conn.execute(sql, params):
-            vec = np.frombuffer(row["embedding"], dtype=np.float32)
-            if vec.size != qvec.size:
-                continue
-            scored.append((
-                _cosine(qvec, vec),
-                {"id": row["id"], "source": row["source"], "ref": row["ref"],
-                 "title": row["title"], "text": row["text"]},
-            ))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    out = []
-    for score, item in scored[:k]:
-        item["score"] = round(score, 4)
-        out.append(item)
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        log.warning("rag_query returned non-JSON: %r", proc.stdout[:200])
+        return []
+
+    out: list[dict] = []
+    for r in payload.get("results", []):
+        src = r.get("source", "?")
+        if source and source.lower() not in src.lower() \
+                and source.lower() not in str(r.get("book_title", "")).lower():
+            continue
+        page = r.get("page", "?")
+        out.append({
+            "id": r.get("chunk_idx", "?"),
+            "source": src,
+            "ref": f"p.{page}" if page not in ("?", None, "") else "",
+            "title": r.get("book_title", src),
+            "text": r.get("text", ""),
+            "score": r.get("score", 0.0),
+        })
+        if len(out) >= k:
+            break
     return out

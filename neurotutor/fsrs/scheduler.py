@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 try:
-    from fsrs import Card, FSRS, Rating, State
+    # fsrs v6 renamed FSRS -> Scheduler and dropped Card.reps/.lapses.
+    from fsrs import Card, Rating, Scheduler
     _HAS_FSRS = True
 except Exception:  # pragma: no cover - allow import without lib installed
     _HAS_FSRS = False
@@ -48,35 +50,37 @@ def schedule(
         raise RuntimeError("fsrs package not installed")
 
     now = now or datetime.now(timezone.utc)
-    fsrs = FSRS()
+    sched = Scheduler()
 
     with connect() as conn:
         row = conn.execute(
-            """SELECT stability, difficulty, last_review, review_count, lapses
+            """SELECT card_json, review_count, lapses
                FROM mastery WHERE concept_id=? AND bloom_level=?""",
             (concept_id, bloom_level),
         ).fetchone()
 
-        if row and row["last_review"]:
-            card = Card(
-                stability=row["stability"] or 0.0,
-                difficulty=row["difficulty"] or 5.0,
-                state=State.Review,
-                last_review=datetime.fromisoformat(row["last_review"]),
-                reps=row["review_count"] or 0,
-                lapses=row["lapses"] or 0,
-            )
+        # v6 has no reps/lapses on Card, so we track those ourselves and
+        # reconstruct the exact card state from its serialized form.
+        review_count = (row["review_count"] if row else 0) or 0
+        lapses = (row["lapses"] if row else 0) or 0
+        if row and row["card_json"]:
+            card = Card.from_json(row["card_json"])
         else:
             card = Card()
 
-        card, _log = fsrs.review_card(card, Rating(rating), now)
+        card, _log = sched.review_card(card, Rating(rating), now)
+        review_count += 1
+        if rating == int(Rating.Again):
+            lapses += 1
 
-        mastery = _mastery_from_state(card.stability, card.difficulty, card.lapses)
+        stability = card.stability or 0.0
+        difficulty = card.difficulty or 5.0
+        mastery = _mastery_from_state(stability, difficulty, lapses)
         conn.execute(
             """INSERT INTO mastery(concept_id, bloom_level, mastery, stability,
                                     difficulty, last_review, next_review,
-                                    review_count, lapses)
-               VALUES (?,?,?,?,?,?,?,?,?)
+                                    review_count, lapses, card_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(concept_id, bloom_level) DO UPDATE SET
                     mastery=excluded.mastery,
                     stability=excluded.stability,
@@ -84,24 +88,26 @@ def schedule(
                     last_review=excluded.last_review,
                     next_review=excluded.next_review,
                     review_count=excluded.review_count,
-                    lapses=excluded.lapses""",
+                    lapses=excluded.lapses,
+                    card_json=excluded.card_json""",
             (
                 concept_id,
                 bloom_level,
                 mastery,
-                card.stability,
-                card.difficulty,
+                stability,
+                difficulty,
                 now.isoformat(),
                 card.due.isoformat(),
-                card.reps,
-                card.lapses,
+                review_count,
+                lapses,
+                card.to_json(),
             ),
         )
         conn.commit()
 
     return ReviewOutcome(
-        stability=card.stability,
-        difficulty=card.difficulty,
+        stability=stability,
+        difficulty=difficulty,
         next_review=card.due,
         mastery=mastery,
     )

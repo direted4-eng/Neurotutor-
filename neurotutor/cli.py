@@ -68,6 +68,27 @@ def ask(mode: str = typer.Argument(..., help="diagnostic|review|new|case|osce|im
 
 
 @app.command()
+def drill(user: str = typer.Argument(..., help="telegram user id"),
+          n: int = typer.Option(3, help="сколько вопросов сгенерировать")) -> None:
+    """Сгенерировать N вопросов дня (pending) для пользователя."""
+    from .agent.drill import generate_drill
+    qs = generate_drill(user, n=n)
+    if not qs:
+        print("[yellow]Нет новых вопросов (есть незакрытые или нечего повторять).[/]")
+        return
+    for q in qs:
+        print(f"[bold]{q['concept']}[/] (Блум {q['bloom_level']}): {q['prompt']}")
+
+
+@app.command()
+def report() -> None:
+    """Ретроспективная карта компетенций: пробелы, слабые места, тренд."""
+    import re
+    from .report import format_report_telegram
+    print(re.sub(r"<[^>]+>", "", format_report_telegram()))
+
+
+@app.command()
 def personas() -> None:
     """Список доступных персонажей."""
     from .agent.persona import PERSONAS
