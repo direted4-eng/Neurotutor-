@@ -31,6 +31,8 @@ def build_theory(topic: str, *, question: str = "", answer: str = "") -> str:
         "ключевые факты, анатомию/классификацию (если применимо), "
         "клиническую и хирургическую значимость, типичные ошибки/подводные "
         "камни. Пиши ёмко, но полно (600–1000 слов), точными терминами. "
+        "Пиши СТРОГО на русском языке — без иероглифов и иных нелатинских "
+        "вкраплений (латиница допустима только для терминов и сокращений). "
         "Опирайся на приведённый контекст из учебников. В конце — раздел "
         "## Источники со списком использованных книг."
     )
@@ -42,7 +44,7 @@ def build_theory(topic: str, *, question: str = "", answer: str = "") -> str:
         + (f"Доступные источники: {', '.join(sources)}" if sources else "")
     )
 
-    client = MiniMaxClient()
+    client = MiniMaxClient(timeout=180.0)  # theory notes are long → slow gen
     try:
         resp = client.chat(
             [{"role": "system", "content": sys_prompt},

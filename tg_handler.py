@@ -283,20 +283,21 @@ def send_telegram(text: str, disable_notification: bool = False) -> bool:
         return False
 
 
-def send_telegram_document(filename: str, content: str,
-                           caption: str = "") -> bool:
-    """Отправить текстовый файл (конспект теории) в Telegram."""
+def send_telegram_document(filename: str, content: "str | bytes",
+                           caption: str = "",
+                           mime: str = "text/markdown") -> bool:
+    """Отправить файл (текст или PDF) в Telegram."""
     if not TELEGRAM_TOKEN:
         return False
     user = TELEGRAM_USER or os.getenv("TELEGRAM_USER_ID", "")
+    blob = content.encode("utf-8") if isinstance(content, str) else content
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
             data={"chat_id": user, "caption": caption[:1024],
                   "parse_mode": "HTML", "disable_notification": "true"},
-            files={"document": (filename, content.encode("utf-8"),
-                                "text/markdown")},
-            timeout=30,
+            files={"document": (filename, blob, mime)},
+            timeout=60,
         )
         ok = r.json().get("ok", False)
         if not ok:
@@ -318,7 +319,7 @@ def _safe_filename(topic: str) -> str:
 
 
 def send_theory(topic: str, *, question: str = "", answer: str = "") -> bool:
-    """Сгенерировать конспект по теме и прислать файлом."""
+    """Сгенерировать конспект по теме и прислать красивым PDF (откат — .md)."""
     from neurotutor.theory import build_theory
     try:
         md = build_theory(topic, question=question, answer=answer)
@@ -327,9 +328,20 @@ def send_theory(topic: str, *, question: str = "", answer: str = "") -> bool:
         return False
     if not md:
         return False
-    fname = f"Теория — {_safe_filename(topic)}.md"
-    return send_telegram_document(
-        fname, md, caption=f"📘 Конспект по теме: <b>{topic}</b>")
+
+    base = _safe_filename(topic)
+    caption = f"📘 Конспект по теме: <b>{topic}</b>"
+    try:
+        from neurotutor.render import markdown_to_pdf
+        pdf = markdown_to_pdf(md, title=topic)
+    except Exception:
+        log.exception("pdf render failed")
+        pdf = None
+    if pdf:
+        return send_telegram_document(f"Конспект — {base}.pdf", pdf,
+                                      caption=caption, mime="application/pdf")
+    # откат: если PDF не собрался — отправим markdown-файл
+    return send_telegram_document(f"Конспект — {base}.md", md, caption=caption)
 
 
 # ── inbox reader (file-based, совместим с telegram-bot-agent skill) ───────────

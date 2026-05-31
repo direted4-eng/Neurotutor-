@@ -8,3 +8,4 @@ numpy>=1.26
 pypdf>=4.2
 beautifulsoup4>=4.12
 lxml>=4.9
+markdown>=3.0
