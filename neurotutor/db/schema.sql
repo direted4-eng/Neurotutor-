@@ -125,6 +125,8 @@ CREATE TABLE IF NOT EXISTS pending_questions (
     bloom_level INTEGER NOT NULL DEFAULT 1,
     prompt      TEXT NOT NULL,
     rubric      TEXT,                              -- JSON: criteria for grade_answer
+    kind        TEXT NOT NULL DEFAULT 'recall',    -- recall|case|surgical_steps|emergency|crisis
+    topic       TEXT,                              -- subject label (for remedial theory)
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     answered_at TIMESTAMP
 );

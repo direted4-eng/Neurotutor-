@@ -89,6 +89,19 @@ def report() -> None:
 
 
 @app.command()
+def theory(topic: str = typer.Argument(..., help="тема для конспекта"),
+           out: Path = typer.Option(None, help="сохранить в файл .md")) -> None:
+    """Сгенерировать структурированный конспект теории по теме (из 13 книг)."""
+    from .theory import build_theory
+    md = build_theory(topic)
+    if out:
+        out.write_text(md, encoding="utf-8")
+        print(f"[green]saved[/] {out}")
+    else:
+        print(md)
+
+
+@app.command()
 def personas() -> None:
     """Список доступных персонажей."""
     from .agent.persona import PERSONAS

@@ -283,6 +283,55 @@ def send_telegram(text: str, disable_notification: bool = False) -> bool:
         return False
 
 
+def send_telegram_document(filename: str, content: str,
+                           caption: str = "") -> bool:
+    """Отправить текстовый файл (конспект теории) в Telegram."""
+    if not TELEGRAM_TOKEN:
+        return False
+    user = TELEGRAM_USER or os.getenv("TELEGRAM_USER_ID", "")
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+            data={"chat_id": user, "caption": caption[:1024],
+                  "parse_mode": "HTML", "disable_notification": "true"},
+            files={"document": (filename, content.encode("utf-8"),
+                                "text/markdown")},
+            timeout=30,
+        )
+        ok = r.json().get("ok", False)
+        if not ok:
+            log.error("telegram sendDocument failed: %s", r.text)
+        return ok
+    except Exception:
+        log.exception("telegram sendDocument error")
+        return False
+
+
+# ── ремедиальная теория (слабый ответ → конспект файлом) ──────────────────────
+
+THEORY_THRESHOLD = 0.5   # ниже этой доли — присылаем конспект
+
+
+def _safe_filename(topic: str) -> str:
+    keep = "".join(ch if ch.isalnum() or ch in " -_" else "_" for ch in topic)
+    return (keep.strip()[:60] or "тема")
+
+
+def send_theory(topic: str, *, question: str = "", answer: str = "") -> bool:
+    """Сгенерировать конспект по теме и прислать файлом."""
+    from neurotutor.theory import build_theory
+    try:
+        md = build_theory(topic, question=question, answer=answer)
+    except Exception:
+        log.exception("theory build failed for %s", topic)
+        return False
+    if not md:
+        return False
+    fname = f"Теория — {_safe_filename(topic)}.md"
+    return send_telegram_document(
+        fname, md, caption=f"📘 Конспект по теме: <b>{topic}</b>")
+
+
 # ── inbox reader (file-based, совместим с telegram-bot-agent skill) ───────────
 
 
@@ -409,6 +458,13 @@ def _handle_drill_answer(user_id: str, text: str) -> None:
             if fb.get("next_review") else "")
     msg = f"{mark} <b>Оценка: {pct}</b>\n\n{fb.get('feedback','').strip()}{tail}"
     send_telegram(msg)
+
+    # Слабо справился → присылаем структурированный конспект по теме.
+    if (score or 0) < THEORY_THRESHOLD and fb.get("topic"):
+        send_telegram("📘 Подтяну теорию по этой теме — собираю конспект…",
+                      disable_notification=True)
+        send_theory(fb["topic"], question=fb.get("question", ""), answer=text)
+
     if fb.get("remaining"):
         _send_next_question(user_id)
     else:
@@ -533,5 +589,11 @@ if __name__ == "__main__":
         send_digest(days)
     elif arg == "--report":
         send_report()
+    elif arg == "--theory":
+        topic = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
+        if topic:
+            send_theory(topic)
+        else:
+            print("usage: tg_handler.py --theory <тема>")
     else:
         main()

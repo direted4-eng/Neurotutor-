@@ -247,14 +247,15 @@ def _generate_case() -> dict | None:
 
 def _store_pending(user_id: str, *, kind: str, prompt: str,
                    rubric: list | None, concept_id: int | None = None,
-                   bloom_level: int = 1) -> int:
+                   bloom_level: int = 1, topic: str | None = None) -> int:
     with connect() as conn:
         cur = conn.execute(
             """INSERT INTO pending_questions(user_id, concept_id, bloom_level,
-                                             prompt, rubric, kind)
-               VALUES (?,?,?,?,?,?)""",
+                                             prompt, rubric, kind, topic)
+               VALUES (?,?,?,?,?,?,?)""",
             (user_id, concept_id, bloom_level, prompt,
-             json.dumps(rubric, ensure_ascii=False) if rubric else None, kind),
+             json.dumps(rubric, ensure_ascii=False) if rubric else None,
+             kind, topic),
         )
         return cur.lastrowid
 
@@ -285,7 +286,7 @@ def generate_drill(user_id: str, n_recall: int = 3,
         q = _generate_question(concept, t["bloom_level"])
         qid = _store_pending(user_id, kind="recall", prompt=q["prompt"],
                              rubric=q["rubric"], concept_id=t["concept_id"],
-                             bloom_level=t["bloom_level"])
+                             bloom_level=t["bloom_level"], topic=concept["name"])
         created.append({"id": qid, "kind": "recall", "label": concept["name"],
                         "prompt": q["prompt"]})
 
@@ -297,14 +298,15 @@ def generate_drill(user_id: str, n_recall: int = 3,
                 continue
             qid = _store_pending(user_id, kind="case", prompt=q["prompt"],
                                  rubric=q["rubric"], concept_id=q.get("concept_id"),
-                                 bloom_level=q.get("bloom_level", 3))
+                                 bloom_level=q.get("bloom_level", 3),
+                                 topic=q["label"])
         else:
             q = _generate_scenario(kind)
             if not q:
                 continue
             qid = _store_pending(user_id, kind=kind, prompt=q["prompt"],
                                  rubric=q["rubric"], concept_id=None,
-                                 bloom_level=3)
+                                 bloom_level=3, topic=q["label"])
         created.append({"id": qid, "kind": kind, "label": q["label"],
                         "prompt": q["prompt"]})
 
@@ -383,4 +385,6 @@ def answer_pending(user_id: str, answer: str) -> dict | None:
         "mastery": sched["mastery"] if sched else None,
         "remaining": remaining,
         "kind": row["kind"],
+        "topic": row["topic"],
+        "question": row["prompt"],
     }
