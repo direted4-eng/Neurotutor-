@@ -16,9 +16,10 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 from datetime import datetime, timezone
 
-from ..db.store import connect
+from ..db.store import connect, get_or_create_concept, slugify
 from ..fsrs.scheduler import due_today, pick_new
 from ..llm.minimax import MiniMaxClient, extract_text
 from ..rag import retriever as rag_retriever
@@ -89,6 +90,33 @@ SCENARIO_KINDS = {
             "Разрыв крупной кортикальной вены"],
     },
 }
+
+
+# Each scenario kind is anchored to a competency domain so its concepts feed
+# the right slice of the mastery map (op steps → approaches; emergencies and
+# intraop crises → clinical management).
+SCENARIO_DOMAIN = {
+    "surgical_steps": "approaches",
+    "emergency": "clinical",
+    "crisis": "clinical",
+}
+
+
+def _scenario_concept_id(kind: str, topic: str) -> int | None:
+    """Resolve a scenario seed topic to a tracked concept (get-or-create).
+
+    Without this, scenario drills carried concept_id=None → graded but never
+    scheduled by FSRS and invisible in the domain mastery map. Binding each
+    topic to a concept makes op-steps/emergency/crisis practice build real,
+    spaced-repetition competency just like recall.
+    """
+    domain = SCENARIO_DOMAIN.get(kind)
+    if not domain:
+        return None
+    slug = f"{kind}_{slugify(topic)}"[:120]
+    label = SCENARIO_KINDS.get(kind, {}).get("label", kind)
+    return get_or_create_concept(
+        topic, domain, slug=slug, summary=f"Сценарный навык — {label}: {topic}")
 
 
 # --------------------------- target selection ---------------------------
@@ -205,7 +233,8 @@ def _generate_scenario(kind: str) -> dict | None:
 
     parsed = _parse_json_loose(text) or {}
     return {"prompt": parsed.get("question") or text.strip(),
-            "rubric": parsed.get("rubric"), "label": topic}
+            "rubric": parsed.get("rubric"), "label": topic,
+            "concept_id": _scenario_concept_id(kind, topic), "bloom_level": 3}
 
 
 def _generate_case() -> dict | None:
@@ -217,8 +246,12 @@ def _generate_case() -> dict | None:
     if not row:
         return None
     case = dict(row)
+    # NB: case['title'] is the diagnosis — deliberately NOT shown. The whole
+    # point of a case drill is for the resident to reach the diagnosis from the
+    # clinical picture. The title is carried as `topic` (for grading & reveal),
+    # never in the displayed prompt.
     prompt = (
-        f"Клинический случай: {case['title']}.\n\n{case['presentation']}\n\n"
+        f"Клинический случай.\n\n{case['presentation']}\n\n"
         "Вопрос: ваш дифференциальный диагноз, план обследования и тактика "
         "ведения? Кратко обоснуйте каждый шаг."
     )
@@ -305,12 +338,58 @@ def generate_drill(user_id: str, n_recall: int = 3,
             if not q:
                 continue
             qid = _store_pending(user_id, kind=kind, prompt=q["prompt"],
-                                 rubric=q["rubric"], concept_id=None,
-                                 bloom_level=3, topic=q["label"])
+                                 rubric=q["rubric"], concept_id=q.get("concept_id"),
+                                 bloom_level=q.get("bloom_level", 3), topic=q["label"])
         created.append({"id": qid, "kind": kind, "label": q["label"],
                         "prompt": q["prompt"]})
 
     return created
+
+
+def generate_one(user_id: str, kind: str) -> dict | None:
+    """Generate ONE question of a chosen kind on demand (mode selection).
+
+    Unlike generate_drill (the proactive auto-mix), this is user-initiated:
+    the resident picks a mode (recall / case / surgical_steps / emergency /
+    crisis) and we produce a single matching pending question. Returns the
+    created question dict, or None if nothing of that kind could be built.
+    """
+    if kind == "recall":
+        targets = select_targets(1)
+        if not targets:
+            return None
+        t = targets[0]
+        concept = _concept_detail(t["concept_id"])
+        if not concept:
+            return None
+        q = _generate_question(concept, t["bloom_level"])
+        qid = _store_pending(user_id, kind="recall", prompt=q["prompt"],
+                             rubric=q["rubric"], concept_id=t["concept_id"],
+                             bloom_level=t["bloom_level"], topic=concept["name"])
+        return {"id": qid, "kind": "recall", "label": concept["name"],
+                "bloom_level": t["bloom_level"], "prompt": q["prompt"]}
+
+    if kind == "case":
+        q = _generate_case()
+        if not q:
+            return None
+        qid = _store_pending(user_id, kind="case", prompt=q["prompt"],
+                             rubric=q["rubric"], concept_id=q.get("concept_id"),
+                             bloom_level=q.get("bloom_level", 3), topic=q["label"])
+        return {"id": qid, "kind": "case", "label": q["label"],
+                "prompt": q["prompt"]}
+
+    if kind in SCENARIO_KINDS:
+        q = _generate_scenario(kind)
+        if not q:
+            return None
+        qid = _store_pending(user_id, kind=kind, prompt=q["prompt"],
+                             rubric=q["rubric"], concept_id=q.get("concept_id"),
+                             bloom_level=q.get("bloom_level", 3), topic=q["label"])
+        return {"id": qid, "kind": kind, "label": q["label"],
+                "prompt": q["prompt"]}
+
+    return None
 
 
 # --------------------------- answering ----------------------------------
@@ -347,11 +426,28 @@ def answer_pending(user_id: str, answer: str) -> dict | None:
         return None
 
     rubric = json.loads(row["rubric"]) if row["rubric"] else None
+    # For cases the diagnosis is hidden from the prompt, so hand the grader the
+    # reference diagnosis here (grading-only, never stored or shown) — otherwise
+    # it can't judge whether the resident's differential actually landed.
+    grade_prompt = row["prompt"]
+    if row["kind"] == "case" and row["topic"]:
+        grade_prompt += (
+            f"\n\n[Для проверяющего, студенту НЕ показано — эталонный диагноз: "
+            f"{row['topic']}. Оцени, насколько ответ к нему близок.]")
     g = grade_answer(
-        prompt=row["prompt"], answer=answer,
+        prompt=grade_prompt, answer=answer,
         concept_id=row["concept_id"], bloom_level=row["bloom_level"],
         rubric={"criteria": rubric} if rubric else None,
     )
+
+    # Grader couldn't be parsed → leave the question OPEN and don't touch FSRS,
+    # so a transient hiccup never writes a phantom lapse into the mastery map.
+    if g.get("parse_error") or g.get("score") is None:
+        log.warning("answer left ungraded (parse error) for pending %s", row["id"])
+        return {"ungraded": True, "feedback": g.get("feedback", ""),
+                "kind": row["kind"], "topic": row["topic"],
+                "question": row["prompt"]}
+
     rating = int(g.get("suggested_rating") or 3)
     # Scenario drills (case/emergency/crisis/surgical_steps) aren't bound to a
     # single concept → grade & log them, but only reschedule concept-bound ones.

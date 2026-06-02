@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -166,56 +167,39 @@ def apply_route(state: SessionState, routing: str, persona_hint: str) -> Session
 
 def neurotutor_reply(mode: str, user_message: str,
                     persona: str, history: list[dict]) -> str:
+    """Сгенерировать ответ агента в процессе (без subprocess/CLI).
+
+    history — список dict {role, content} предыдущих ходов; передаётся
+    оркестратору КАК ЕСТЬ, чтобы у диалога была настоящая память. Раньше
+    история клеилась в текст и терялась — отсюда «ботовость» и ответы вида
+    «я не храню контекст». Прямой вызов session.turn() также убирает протечку
+    служебного префикса «role / persona:» из CLI-печати.
     """
-    Вызывает Neurotutor CLI с историей.
+    from neurotutor.session import (turn, start as start_session,
+                                    end as end_session)
 
-    history — список dict с ключами role/content (.messages[-MAX_HISTORY:]).
-    Преобразуем в текстовую историю для CLI-команды (history пока не
-    поддерживается через аргументы, поэтому склеиваем в строку).
-    """
-    # собираем history как текст
-    hist_block = ""
-    if history:
-        lines = []
-        for h in history[-MAX_HISTORY:]:
-            role = h.get("role", "user")
-            content = h.get("content", "")
-            if content:
-                lines.append(f"{role.title()}: {content}")
-        if lines:
-            hist_block = "\n".join(lines) + "\n\n"
+    hist = [h for h in (history or [])[-(MAX_HISTORY * 2):]
+            if h.get("role") in ("user", "assistant") and h.get("content")]
 
-    full_prompt = f"{hist_block}Пользователь: {user_message}"
-
-    # работаем в директории проекта
-    cmd = [
-        sys.executable, "-m", "neurotutor.cli", "ask",
-        mode, full_prompt,
-        "--persona", persona,
-    ]
-
+    sid = None
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(BASE_DIR),
-        )
-        if result.returncode != 0:
-            log.error("CLI error: %s", result.stderr)
-            return f"[ошибка CLI: {result.stderr.strip()}]"
-        # output может содержать rich-разметку — убираем ttags
-        out = result.stdout.strip()
-        # убираем строки-артефакты от rich
-        lines = [l for l in out.splitlines()
-                 if not l.startswith("\x1b[") and "tool " not in l.lower()]
-        return "\n".join(lines).strip()
-    except subprocess.TimeoutExpired:
-        return "[тайм-аут 120 сек — попробуй ещё раз]"
+        sid = start_session(mode, notes="tg chat")
+    except Exception:
+        log.exception("session start failed (continuing without persist)")
+        sid = None
+    try:
+        out = turn(mode, user_message, history=hist,
+                   persona=persona, session_id=sid)
+        return (out.get("reply") or "").strip() or "[пустой ответ — переформулируй?]"
     except Exception:
         log.exception("neurotutor reply failed")
         return "[внутренняя ошибка, попробуй позже]"
+    finally:
+        if sid is not None:
+            try:
+                end_session(sid)
+            except Exception:
+                log.exception("session end failed")
 
 
 # ── утреннее напоминание (due cards) ─────────────────────────────────────────
@@ -257,21 +241,25 @@ if TELEGRAM_USER:
     TELEGRAM_USER = str(TELEGRAM_USER).lstrip("@")
 
 
-def send_telegram(text: str, disable_notification: bool = False) -> bool:
+def send_telegram(text: str, disable_notification: bool = False,
+                  reply_markup: dict | None = None) -> bool:
     """Отправить сообщение пользователю через Telegram Bot API."""
     if not TELEGRAM_TOKEN:
         log.warning("TELEGRAM_BOT_TOKEN не задан, пропускаю отправку")
         return False
     user = TELEGRAM_USER or os.getenv("TELEGRAM_USER_ID", "")
+    payload = {
+        "chat_id":    user,
+        "text":       text,
+        "parse_mode": "HTML",
+        "disable_notification": disable_notification,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id":    user,
-                "text":       text,
-                "parse_mode": "HTML",
-                "disable_notification": disable_notification,
-            },
+            json=payload,
             timeout=10,
         )
         ok = r.json().get("ok", False)
@@ -342,6 +330,36 @@ def send_theory(topic: str, *, question: str = "", answer: str = "") -> bool:
                                       caption=caption, mime="application/pdf")
     # откат: если PDF не собрался — отправим markdown-файл
     return send_telegram_document(f"Конспект — {base}.md", md, caption=caption)
+
+
+# алгоритмические режимы: при ошибке шлём сам эталонный алгоритм, не конспект
+ALGO_KINDS = {"surgical_steps", "emergency", "crisis"}
+
+
+def send_algorithm(topic: str, *, kind: str = "", question: str = "",
+                   answer: str = "") -> bool:
+    """Сгенерировать эталонный пошаговый алгоритм и прислать PDF (откат — .md)."""
+    from neurotutor.theory import build_algorithm
+    try:
+        md = build_algorithm(topic, kind=kind, question=question, answer=answer)
+    except Exception:
+        log.exception("algorithm build failed for %s", topic)
+        return False
+    if not md:
+        return False
+
+    base = _safe_filename(topic)
+    caption = f"📐 Эталонный алгоритм: <b>{topic}</b>"
+    try:
+        from neurotutor.render import markdown_to_pdf
+        pdf = markdown_to_pdf(md, title=topic)
+    except Exception:
+        log.exception("pdf render failed")
+        pdf = None
+    if pdf:
+        return send_telegram_document(f"Алгоритм — {base}.pdf", pdf,
+                                      caption=caption, mime="application/pdf")
+    return send_telegram_document(f"Алгоритм — {base}.md", md, caption=caption)
 
 
 # ── inbox reader (file-based, совместим с telegram-bot-agent skill) ───────────
@@ -416,6 +434,90 @@ def _send_next_question(user_id: str | int) -> bool:
     return True
 
 
+# ── выбор режима тренировки (инлайн-кнопки) ───────────────────────────────────
+
+# порядок и подписи кнопок меню режимов (callback_data = "mode:<kind>")
+MODE_MENU = [
+    ("🧠 Тест (припоминание)", "recall"),
+    ("🏥 Клинический случай", "case"),
+    ("🔪 Ход операции", "surgical_steps"),
+    ("🚨 Экстренный алгоритм", "emergency"),
+    ("⚡ Интраоп. кризис", "crisis"),
+]
+
+# что открывает меню режимов
+MODE_MENU_TRIGGERS = {"/mode", "/menu", "/start", "режим", "режимы",
+                      "меню", "старт", "выбор режима", "тренировка"}
+
+# явный запрос конспекта: «конспект по аневризмам», «сделай теорию о шунтах»
+CONSPECT_RE = re.compile(
+    r"^\s*(?:сделай|собери|дай|нужен|нужна|хочу|пришли|скинь|можешь(?:\s+\w+)?)?\s*"
+    r"(?:конспект|теори[яю])\b\s*(?:по|на|о[бо]?|про)?\s*(.*)$",
+    re.IGNORECASE)
+
+# грубый инференс домена по ключевым словам — чтобы изученный конспектом топик
+# попал в нужный срез карты компетенций (расширяет граф за пределы seed).
+_DOMAIN_HINTS = [
+    ("approaches", ("доступ", "краниотом", "резекц", "клипир", "операц",
+                    "шунт", "эндоскоп", "трепанац")),
+    ("radiology", ("кт", "мрт", "ангио", "снимок", "визуализац", "dwi",
+                   "flair", "перфузи", "трактограф")),
+    ("pathology", ("опухол", "глиом", "менингиом", "патолог", "гистолог",
+                   "who", "карцином", "метастаз")),
+    ("anatomy", ("анатом", "цистерн", "тракт", "ядро", "извилин", "артери",
+                 "вена", "нерв", "сплетени")),
+]
+
+
+def _infer_domain(topic: str) -> str:
+    t = topic.lower()
+    for domain, words in _DOMAIN_HINTS:
+        if any(w in t for w in words):
+            return domain
+    return "clinical"
+
+
+def send_mode_menu() -> None:
+    """Прислать инлайн-кнопки выбора режима тренировки."""
+    keyboard = {"inline_keyboard": [
+        [{"text": label, "callback_data": f"mode:{kind}"}]
+        for label, kind in MODE_MENU
+    ]}
+    send_telegram(
+        "🎛 <b>Выбери режим тренировки</b>\n"
+        "<i>Тест и кейс при ошибке → конспект из учебников; "
+        "алгоритмы → эталонный пошаговый алгоритм.</i>",
+        disable_notification=True, reply_markup=keyboard)
+
+
+def answer_callback_query(callback_id: str) -> None:
+    """Снять «часики» с нажатой инлайн-кнопки."""
+    if not TELEGRAM_TOKEN or not callback_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_id}, timeout=10)
+    except Exception:
+        log.exception("answerCallbackQuery failed")
+
+
+def handle_callback(data: str, user_id: str | int) -> None:
+    """Обработать нажатие инлайн-кнопки выбора режима."""
+    if not data.startswith("mode:"):
+        return
+    kind = data.split(":", 1)[1]
+    label = KIND_LABELS.get(kind, kind)
+    send_telegram(f"🎯 Режим: <b>{label}</b>. Готовлю вопрос…",
+                  disable_notification=True)
+    q = drill.generate_one(str(user_id), kind)
+    if not q:
+        send_telegram("Не удалось собрать вопрос этого типа — попробуй другой "
+                      "режим (/mode).")
+        return
+    send_telegram(_format_question(q, 1, 1))
+
+
 def send_drill(n: int = 3) -> None:
     """Сгенерировать набор дня (припоминание + сценарии) и отправить первый."""
     uid = TELEGRAM_USER or os.getenv("TELEGRAM_USER_ID", "")
@@ -463,6 +565,14 @@ def _handle_drill_answer(user_id: str, text: str) -> None:
     fb = drill.answer_pending(user_id, text)
     if fb is None:
         return
+
+    # Грейдер не смог разобрать ответ — вопрос остался открытым, просим повторить.
+    if fb.get("ungraded"):
+        send_telegram("⚠️ Не смог корректно оценить ответ (сбой парсинга). "
+                      "Вопрос остался открытым — попробуй переформулировать.")
+        _send_next_question(user_id)
+        return
+
     score = fb.get("score")
     pct = f"{round((score or 0) * 100)}%"
     mark = "✅" if (score or 0) >= 0.7 else ("🟡" if (score or 0) >= 0.4 else "❌")
@@ -471,11 +581,24 @@ def _handle_drill_answer(user_id: str, text: str) -> None:
     msg = f"{mark} <b>Оценка: {pct}</b>\n\n{fb.get('feedback','').strip()}{tail}"
     send_telegram(msg)
 
-    # Слабо справился → присылаем структурированный конспект по теме.
-    if (score or 0) < THEORY_THRESHOLD and fb.get("topic"):
-        send_telegram("📘 Подтяну теорию по этой теме — собираю конспект…",
+    # Кейс: диагноз скрывался в вопросе — теперь, после ответа, раскрываем его.
+    if fb.get("kind") == "case" and fb.get("topic"):
+        send_telegram(f"🩺 Правильный диагноз: <b>{fb['topic']}</b>",
                       disable_notification=True)
-        send_theory(fb["topic"], question=fb.get("question", ""), answer=text)
+
+    # Слабо справился → ремедиация зависит от режима:
+    #   алгоритм (ход операции/экстренный/кризис) → эталонный алгоритм;
+    #   тест/кейс → структурированный конспект из RAG.
+    if (score or 0) < THEORY_THRESHOLD and fb.get("topic"):
+        if fb.get("kind") in ALGO_KINDS:
+            send_telegram("📐 Покажу эталонный алгоритм по этой теме…",
+                          disable_notification=True)
+            send_algorithm(fb["topic"], kind=fb["kind"],
+                           question=fb.get("question", ""), answer=text)
+        else:
+            send_telegram("📘 Подтяну теорию по этой теме — собираю конспект…",
+                          disable_notification=True)
+            send_theory(fb["topic"], question=fb.get("question", ""), answer=text)
 
     if fb.get("remaining"):
         _send_next_question(user_id)
@@ -487,6 +610,11 @@ def handle_message(raw: dict, user_id: str | int) -> None:
     """Обработать одно входящее сообщение."""
     text = raw.get("text", "").strip()
     if not text:
+        return
+
+    # Открыть меню выбора режима (инлайн-кнопки) — раньше всякой маршрутизации.
+    if text.lower().strip() in MODE_MENU_TRIGGERS:
+        send_mode_menu()
         return
 
     state = load_session(user_id)
@@ -503,6 +631,29 @@ def handle_message(raw: dict, user_id: str | int) -> None:
     if any(kw in low for kw in ("отчёт", "отчет", "прогресс", "компетенц",
                                  "карта знаний", "мои пробелы", "/report")):
         send_report()
+        return
+
+    # Явный запрос конспекта по теме → собрать и прислать PDF из RAG.
+    m = CONSPECT_RE.match(text)
+    if m:
+        topic = m.group(1).strip(" .?!:;—-").strip()
+        if not topic:
+            send_telegram("📘 По какой теме собрать конспект? Напиши, например: "
+                          "«конспект по аневризмам ПСА».")
+            return
+        send_telegram(f"📘 Собираю конспект по теме «<b>{topic}</b>» из учебников… "
+                      "(полминуты)", disable_notification=True)
+        if not send_theory(topic):
+            send_telegram("Не получилось собрать конспект — уточни тему?")
+            return
+        # Регистрируем изученный топик как концепт: он войдёт в карту
+        # компетенций как «изучено, но не проверено» (пробел до проверки).
+        try:
+            from neurotutor.db.store import get_or_create_concept
+            get_or_create_concept(topic, _infer_domain(topic),
+                                  summary="Изучено по конспекту (ещё не проверено)")
+        except Exception:
+            log.exception("concept registration failed for %s", topic)
         return
 
     # Если у пользователя висит вопрос дня и это не явная смена режима —
@@ -567,6 +718,19 @@ def main() -> None:
             updates = data.get("result", [])
             for upd in updates:
                 last_offset = upd["update_id"]
+
+                # нажатие инлайн-кнопки (выбор режима)
+                if "callback_query" in upd:
+                    cq = upd["callback_query"]
+                    cq_from = str(cq.get("from", {}).get("id", ""))
+                    if TELEGRAM_USER and cq_from != str(TELEGRAM_USER):
+                        continue
+                    answer_callback_query(cq.get("id", ""))
+                    cdata = cq.get("data", "")
+                    log.info("⮞ callback [%s] %s", cq_from or "?", cdata)
+                    handle_callback(cdata, user_id=cq_from or 0)
+                    continue
+
                 msg = upd.get("message", {})
                 # проверяем user_id
                 msg_from = str(msg.get("from", {}).get("id", ""))
@@ -601,6 +765,8 @@ if __name__ == "__main__":
         send_digest(days)
     elif arg == "--report":
         send_report()
+    elif arg == "--menu":
+        send_mode_menu()
     elif arg == "--theory":
         topic = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
         if topic:

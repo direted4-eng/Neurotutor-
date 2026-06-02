@@ -12,10 +12,18 @@ from datetime import datetime, timedelta, timezone
 
 from .db.store import connect
 
+# Drill task-types (responses.role = kind). Distinct namespace from the
+# conversational tutor roles below — they were being mixed in one section.
 KIND_RU = {
     "recall": "Припоминание", "case": "Клинические случаи",
     "surgical_steps": "Ход операции", "emergency": "Экстренные алгоритмы",
     "crisis": "Интраоп. кризисы",
+}
+
+# Conversational tutor roles (responses.role = role name from ROLE_BY_MODE).
+ROLE_RU = {
+    "anatomist": "Анатомия", "clinician": "Клиника", "radiologist": "Радиология",
+    "examiner": "Экзамен (OSCE)", "diagnostician": "Диагностика",
 }
 
 
@@ -112,12 +120,26 @@ def format_report_telegram() -> str:
                          f"— {_pct(w['mastery'])}"
                          + (f", срывов: {w['lapses']}" if w["lapses"] else ""))
 
-    # scenario performance
-    if r["kinds"]:
-        lines.append("\n<b>По типам заданий</b>:")
-        for k in r["kinds"]:
-            lines.append(f"  • {KIND_RU.get(k['kind'], k['kind'])}: "
+    # performance split by namespace: drill task-types vs conversational roles
+    drill_kinds = [k for k in r["kinds"] if k["kind"] in KIND_RU]
+    chat_roles = [k for k in r["kinds"] if k["kind"] in ROLE_RU]
+    other = [k for k in r["kinds"]
+             if k["kind"] not in KIND_RU and k["kind"] not in ROLE_RU]
+
+    if drill_kinds:
+        lines.append("\n<b>По типам заданий</b> (дрилл):")
+        for k in drill_kinds:
+            lines.append(f"  • {KIND_RU[k['kind']]}: "
                          f"{_pct(k['avg_grade'])} ({k['n']})")
+    if chat_roles:
+        lines.append("\n<b>По ролям в диалоге</b>:")
+        for k in chat_roles:
+            lines.append(f"  • {ROLE_RU[k['kind']]}: "
+                         f"{_pct(k['avg_grade'])} ({k['n']})")
+    if other:
+        lines.append("\n<b>Прочее</b>:")
+        for k in other:
+            lines.append(f"  • {k['kind']}: {_pct(k['avg_grade'])} ({k['n']})")
 
     # gaps
     if r["untouched"]:

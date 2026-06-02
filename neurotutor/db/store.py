@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -78,3 +79,34 @@ def _seed_domains(conn: sqlite3.Connection) -> None:
 
 def load_json_seed(path: Path) -> list[dict]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def slugify(text: str) -> str:
+    """Stable slug from a (possibly Cyrillic) topic name. \\w is unicode-aware."""
+    s = re.sub(r"[^\w]+", "_", text.strip().lower(), flags=re.UNICODE)
+    return s.strip("_")[:120] or "concept"
+
+
+def get_or_create_concept(name: str, domain_code: str, *,
+                          slug: str | None = None,
+                          summary: str | None = None) -> int | None:
+    """Return the concept id for `slug` (or derived from name), creating it
+    under `domain_code` if absent. Returns None if the domain is unknown.
+
+    This lets the concept graph grow beyond the static seed: any topic the
+    resident actually engages with (scenario drills, theory notes) becomes a
+    tracked concept, so it surfaces in mastery/FSRS and the competency map.
+    """
+    slug = slug or slugify(name)
+    with connect() as conn:
+        row = conn.execute("SELECT id FROM concepts WHERE slug=?", (slug,)).fetchone()
+        if row:
+            return row["id"]
+        d = conn.execute("SELECT id FROM domains WHERE code=?",
+                         (domain_code,)).fetchone()
+        if not d:
+            return None
+        cur = conn.execute(
+            "INSERT INTO concepts(domain_id, name, slug, summary) VALUES (?,?,?,?)",
+            (d["id"], name, slug, summary))
+        return cur.lastrowid

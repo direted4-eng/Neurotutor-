@@ -325,6 +325,22 @@ def case_simulator(
             "presentation": case["presentation"]}
 
 
+def _rating_from_score(score: float) -> int:
+    """Map a 0..1 score to an FSRS rating deterministically.
+
+    Keeps the spaced-repetition signal consistent with the displayed score
+    instead of letting the model pick a rating independently of its own marks.
+    1=again, 2=hard, 3=good, 4=easy.
+    """
+    if score >= 0.85:
+        return 4
+    if score >= 0.6:
+        return 3
+    if score >= 0.4:
+        return 2
+    return 1
+
+
 def grade_answer(
     prompt: str,
     answer: str,
@@ -332,7 +348,14 @@ def grade_answer(
     bloom_level: int | None = None,
     rubric: dict | None = None,
 ) -> dict:
-    """Grade with the text model. Rubric defaults vary by Bloom level."""
+    """Grade with the text model, then ground the score in the rubric.
+
+    The overall score is computed as the mean of the per-criterion marks the
+    model returns (not a free-floating holistic number), and the FSRS rating is
+    derived deterministically from that score. If the model's JSON can't be
+    parsed we return an *ungraded* result (score=None) rather than a fake 0 —
+    so a parser hiccup never corrupts mastery with a phantom lapse.
+    """
     from ..llm.minimax import MiniMaxClient, extract_text
 
     default_rubric = {
@@ -349,11 +372,14 @@ def grade_answer(
     client = MiniMaxClient()
     try:
         sys = (
-            "Ты строгий экзаменатор по нейрохирургии. Оцени ответ по критериям. "
-            "Верни ТОЛЬКО сырой JSON, без markdown, без ``` блоков, без пояснений. "
-            "Формат: {\"score\": 0..1, \"breakdown\": {criterion: 0..1}, "
-            "\"feedback\": str, \"suggested_rating\": 1..4}. "
-            "1=again, 2=hard, 3=good, 4=easy."
+            "Ты строгий экзаменатор по нейрохирургии. Оцени ответ СТРОГО по "
+            "каждому из заданных критериев и поставь каждому балл 0..1 "
+            "(0 — критерий не выполнен, 1 — выполнен полностью; дроби допустимы). "
+            "Не завышай: частично верный ответ — это 0.4–0.6, не 0.8. "
+            "В feedback кратко (1–3 предложения) укажи, что верно и что упущено, "
+            "по-русски. Верни ТОЛЬКО сырой JSON, без markdown и без ``` блоков. "
+            "Формат: {\"breakdown\": {<каждый критерий>: 0..1}, \"feedback\": str}. "
+            "Ключи breakdown — ровно из списка criteria."
         )
         user = json.dumps({"prompt": prompt, "answer": answer,
                            "criteria": criteria}, ensure_ascii=False)
@@ -369,8 +395,22 @@ def grade_answer(
     result = _parse_json_loose(text)
     if result is None:
         log.warning("grade_answer: failed to parse JSON; raw response: %r", text[:500])
-        result = {"score": 0.0, "breakdown": {}, "feedback": text,
-                  "suggested_rating": 1, "parse_error": True}
+        return {"score": None, "breakdown": {}, "feedback": text[:500].strip(),
+                "suggested_rating": None, "parse_error": True,
+                "concept_id": concept_id, "bloom_level": bloom_level}
+
+    breakdown = result.get("breakdown") or {}
+    marks = [float(v) for v in breakdown.values()
+             if isinstance(v, (int, float))]
+    if marks:
+        score = sum(marks) / len(marks)
+    else:
+        raw = result.get("score")
+        score = float(raw) if isinstance(raw, (int, float)) else 0.0
+    score = max(0.0, min(1.0, score))
+
+    result["score"] = score
+    result["suggested_rating"] = _rating_from_score(score)
     result["concept_id"] = concept_id
     result["bloom_level"] = bloom_level
     return result
