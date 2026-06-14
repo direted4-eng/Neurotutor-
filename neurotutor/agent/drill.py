@@ -17,7 +17,7 @@ import json
 import logging
 import random
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from ..db.store import connect, get_or_create_concept, slugify
 from ..fsrs.scheduler import due_today, pick_new
@@ -97,8 +97,8 @@ SCENARIO_KINDS = {
 # intraop crises → clinical management).
 SCENARIO_DOMAIN = {
     "surgical_steps": "approaches",
-    "emergency": "clinical",
-    "crisis": "clinical",
+    "emergency": "neurocritical",
+    "crisis": "neurocritical",
 }
 
 
@@ -237,6 +237,28 @@ def _generate_scenario(kind: str) -> dict | None:
             "concept_id": _scenario_concept_id(kind, topic), "bloom_level": 3}
 
 
+# Disease-specific severity scales that would betray the diagnosis category if
+# shown upfront (Hunt-Hess → SAH, WHO grade → tumour, ASIA → cord injury…).
+# GCS / vitals / exam findings stay — they're generic, not diagnosis tells.
+# Stripped scales remain available on demand via case_followup: the resident
+# must ASK for them, the way they'd order a test in a real workup.
+_SCALE_RE = re.compile(
+    r"\b(?:hunt[\s-]*hess|хант[\w-]*|fisher|фишер|who\s*grade|spetzler[\s-]*martin|"
+    r"спетцл[\w-]*|asia|house[\s-]*brackmann|karnofsky|карновск[\w-]*|wfns|mrs|"
+    r"rankin|ранкин)\b\s*(?:grade|степень|класс|score)?\s*(?:[:=\-—]\s*)?"
+    r"(?:[IVX]{1,4}|[A-E]\b|\d{1,3})?",
+    re.IGNORECASE)
+
+
+def _strip_scales(text: str) -> str:
+    """Remove diagnosis-revealing severity-scale gradings from a case blurb."""
+    cleaned = _SCALE_RE.sub("", text)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([.,;:])", r"\1", cleaned)            # space before punct
+    cleaned = re.sub(r"([.,;:])(\s*[.,;:])+", r"\1", cleaned)   # doubled punct
+    return cleaned.strip()
+
+
 def _generate_case() -> dict | None:
     """Pull a random clinical case and frame it as a management question."""
     with connect() as conn:
@@ -249,9 +271,10 @@ def _generate_case() -> dict | None:
     # NB: case['title'] is the diagnosis — deliberately NOT shown. The whole
     # point of a case drill is for the resident to reach the diagnosis from the
     # clinical picture. The title is carried as `topic` (for grading & reveal),
-    # never in the displayed prompt.
+    # never in the displayed prompt. Severity scales are stripped too (they leak
+    # the diagnosis category) — available on demand via case_followup.
     prompt = (
-        f"Клинический случай.\n\n{case['presentation']}\n\n"
+        f"Клинический случай.\n\n{_strip_scales(case['presentation'])}\n\n"
         "Вопрос: ваш дифференциальный диагноз, план обследования и тактика "
         "ведения? Кратко обоснуйте каждый шаг."
     )
@@ -297,17 +320,20 @@ def generate_drill(user_id: str, n_recall: int = 3,
                    scenario_kinds: list[str] | None = None) -> list[dict]:
     """Build a varied drill batch: spaced-repetition recall + scenarios.
 
-    Skips entirely if the user already has open (unanswered) questions.
-    scenario_kinds defaults to one clinical case + two random scenario types
-    (emergency / crisis / surgical_steps) for proactive practice.
+    Stale open questions (older than STALE_HOURS) are expired first, so one
+    missed day never freezes the loop forever. Skips only if *fresh* open
+    questions remain. scenario_kinds defaults to one clinical case + one random
+    scenario type (emergency / crisis / surgical_steps): the batch is sized to
+    the real answering pace, a backlog kills engagement faster than scarcity.
     """
+    expire_stale(user_id)
     if has_open(user_id):
         log.info("user %s has open questions, skipping generation", user_id)
         return []
 
     if scenario_kinds is None:
         pool = list(SCENARIO_KINDS.keys())
-        scenario_kinds = ["case"] + random.sample(pool, k=min(2, len(pool)))
+        scenario_kinds = ["case"] + random.sample(pool, k=min(1, len(pool)))
 
     created: list[dict] = []
 
@@ -343,6 +369,40 @@ def generate_drill(user_id: str, n_recall: int = 3,
         created.append({"id": qid, "kind": kind, "label": q["label"],
                         "prompt": q["prompt"]})
 
+    return created
+
+
+def generate_calibration(user_id: str) -> list[dict]:
+    """Seed the mastery map: one baseline question per competency domain.
+
+    The cold-start problem: with zero reviewed pairs the tutor doesn't know
+    the resident's actual level, so drills start blind. Calibration asks one
+    never-reviewed concept per domain (Bloom 1–2); answers flow through the
+    normal grade→FSRS pipeline, so every domain gets a real first data point.
+    Clears the current queue first — calibration is an explicit restart.
+    """
+    from ..db.store import DOMAINS
+
+    expire_all_open(user_id)
+    created: list[dict] = []
+    for code, _title, _target in DOMAINS:
+        picks = pick_new(limit=1, domain=code)
+        if not picks:
+            continue
+        concept = _concept_detail(picks[0]["concept_id"])
+        if not concept:
+            continue
+        bloom = random.choice((1, 2))
+        try:
+            q = _generate_question(concept, bloom)
+        except Exception:
+            log.exception("calibration question failed for %s", concept["name"])
+            continue
+        qid = _store_pending(user_id, kind="recall", prompt=q["prompt"],
+                             rubric=q["rubric"], concept_id=concept["id"],
+                             bloom_level=bloom, topic=concept["name"])
+        created.append({"id": qid, "kind": "recall", "label": concept["name"],
+                        "domain": code, "prompt": q["prompt"]})
     return created
 
 
@@ -394,12 +454,103 @@ def generate_one(user_id: str, kind: str) -> dict | None:
 
 # --------------------------- answering ----------------------------------
 
+# Unanswered questions older than this are expired (not graded, not a lapse):
+# without a TTL one missed day used to freeze generate_drill permanently.
+STALE_HOURS = 48
+
+
+def _ensure_expired_column() -> None:
+    """Idempotent migration: add pending_questions.expired_at / tg_message_id."""
+    with connect() as conn:
+        cols = [r[1] for r in conn.execute(
+            "PRAGMA table_info(pending_questions)").fetchall()]
+        if "expired_at" not in cols:
+            conn.execute(
+                "ALTER TABLE pending_questions ADD COLUMN expired_at TIMESTAMP")
+        if "tg_message_id" not in cols:
+            # Telegram message_id of the message that DELIVERED this question.
+            # Lets an answer sent as a Telegram reply bind to the exact question
+            # it replies to — instead of always grading the oldest open one.
+            conn.execute(
+                "ALTER TABLE pending_questions ADD COLUMN tg_message_id INTEGER")
+
+
+_ensure_expired_column()
+
+
+def set_question_message(qid: int, tg_message_id: int | None) -> None:
+    """Remember which Telegram message delivered a given pending question."""
+    if not qid or not tg_message_id:
+        return
+    with connect() as conn:
+        conn.execute(
+            "UPDATE pending_questions SET tg_message_id=? WHERE id=?",
+            (tg_message_id, qid))
+
+
+def open_question_by_message(user_id: str, tg_message_id: int) -> dict | None:
+    """Find the OPEN pending question delivered by a given Telegram message.
+
+    Used for reply-binding: when the resident answers via Telegram «reply» to a
+    specific question, we grade that one instead of the oldest in the queue.
+    Returns None if no open question matches that message.
+    """
+    if not tg_message_id:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT id, concept_id, bloom_level, prompt, kind
+               FROM pending_questions
+               WHERE user_id=? AND tg_message_id=?
+                 AND answered_at IS NULL AND expired_at IS NULL
+               LIMIT 1""",
+            (user_id, tg_message_id)).fetchone()
+    return dict(row) if row else None
+
+
+def expire_stale(user_id: str, max_age_hours: int = STALE_HOURS) -> int:
+    """Expire open questions older than the TTL. Returns how many expired.
+
+    Expiry is neutral: no grade, no FSRS lapse — the concept just comes back
+    through normal due/new selection later.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+              ).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        cur = conn.execute(
+            """UPDATE pending_questions SET expired_at=?
+               WHERE user_id=? AND answered_at IS NULL AND expired_at IS NULL
+                 AND created_at <= ?""",
+            (now, user_id, cutoff))
+    if cur.rowcount:
+        log.info("expired %d stale question(s) for user %s", cur.rowcount, user_id)
+    return cur.rowcount
+
+
+def expire_all_open(user_id: str) -> int:
+    """Expire every open question (used when the user restarts the queue)."""
+    return expire_stale(user_id, max_age_hours=0)
+
+
+def skip_first(user_id: str) -> dict | None:
+    """Expire just the oldest open question («пропусти»). Returns it, or None."""
+    pend = open_questions(user_id)
+    if not pend:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as conn:
+        conn.execute("UPDATE pending_questions SET expired_at=? WHERE id=?",
+                     (now, pend[0]["id"]))
+    return pend[0]
+
+
 def open_questions(user_id: str) -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
             """SELECT id, concept_id, bloom_level, prompt, kind
                FROM pending_questions
-               WHERE user_id=? AND answered_at IS NULL
+               WHERE user_id=? AND answered_at IS NULL AND expired_at IS NULL
                ORDER BY created_at ASC""",
             (user_id,),
         ).fetchall()
@@ -410,6 +561,65 @@ def has_open(user_id: str) -> bool:
     return bool(open_questions(user_id))
 
 
+def case_followup(user_id: str, query: str, qid: int | None = None) -> str | None:
+    """Answer an exploratory request during an OPEN case (scale, lab, imaging).
+
+    The resident works the case interactively — asking for findings or scale
+    scores the way they'd order tests in a real workup. We answer from the full
+    case record (which still holds the scales stripped from the prompt) but
+    never reveal or hint at the diagnosis: that's theirs to commit via
+    «заключение». Returns None if there is no open case (or on failure).
+
+    qid pins the followup to a specific open case (reply-binding); without it we
+    use the oldest open question.
+    """
+    open_q = open_questions(user_id)
+    if not open_q:
+        return None
+    with connect() as conn:
+        if qid is not None:
+            row = conn.execute(
+                "SELECT topic, prompt, kind FROM pending_questions WHERE id=? "
+                "AND user_id=? AND answered_at IS NULL AND expired_at IS NULL "
+                "LIMIT 1", (qid, user_id)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT topic, prompt, kind FROM pending_questions WHERE user_id=? "
+                "AND answered_at IS NULL AND expired_at IS NULL "
+                "ORDER BY created_at ASC LIMIT 1",
+                (user_id,)).fetchone()
+        if not row or row["kind"] != "case":
+            return None
+        case = conn.execute(
+            "SELECT presentation FROM cases WHERE title=?",
+            (row["topic"],)).fetchone() if row and row["topic"] else None
+    presentation = case["presentation"] if case else (row["prompt"] if row else "")
+
+    client = MiniMaxClient()
+    try:
+        sys = (
+            "Ты ведёшь интерактивный клинический разбор с ординатором. Он изучает "
+            "случай и запрашивает данные: оценку по шкале, лабораторию, результат "
+            "КТ/МРТ/ангиографии, детали осмотра. Ответь ТОЛЬКО на запрос — кратко "
+            "и по делу, опираясь на случай. Если просят шкалу — посчитай по данным "
+            "и дай балл с краткой расшифровкой. Если просят обследование — дай "
+            "правдоподобный результат, согласованный со случаем. КАТЕГОРИЧЕСКИ не "
+            "называй итоговый диагноз и не намекай на него: ординатор ставит его "
+            "сам. Пиши по-русски."
+        )
+        user = json.dumps({"случай": presentation, "запрос": query},
+                          ensure_ascii=False)
+        resp = client.chat(
+            [{"role": "system", "content": sys},
+             {"role": "user", "content": user}], temperature=0.2)
+        return extract_text(resp).strip() or None
+    except Exception:
+        log.exception("case_followup failed")
+        return None
+    finally:
+        client.close()
+
+
 def answer_pending(user_id: str, answer: str) -> dict | None:
     """Grade the oldest open question, reschedule, persist. Returns feedback.
 
@@ -418,13 +628,39 @@ def answer_pending(user_id: str, answer: str) -> dict | None:
     with connect() as conn:
         row = conn.execute(
             """SELECT * FROM pending_questions
-               WHERE user_id=? AND answered_at IS NULL
+               WHERE user_id=? AND answered_at IS NULL AND expired_at IS NULL
                ORDER BY created_at ASC LIMIT 1""",
             (user_id,),
         ).fetchone()
     if not row:
         return None
+    return _grade_pending_row(user_id, row, answer)
 
+
+def answer_specific(user_id: str, qid: int, answer: str) -> dict | None:
+    """Grade a SPECIFIC open question by id (reply-binding), not the oldest.
+
+    Returns None if that question id is not an open question for this user, so
+    the caller can fall back to the normal oldest-first path.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM pending_questions
+               WHERE id=? AND user_id=? AND answered_at IS NULL
+                 AND expired_at IS NULL LIMIT 1""",
+            (qid, user_id),
+        ).fetchone()
+    if not row:
+        return None
+    return _grade_pending_row(user_id, row, answer)
+
+
+def _grade_pending_row(user_id: str, row, answer: str) -> dict | None:
+    """Grade one pending-question row, reschedule (FSRS), persist the response.
+
+    Shared by answer_pending (oldest) and answer_specific (reply-bound) so both
+    paths grade, schedule and record identically.
+    """
     rubric = json.loads(row["rubric"]) if row["rubric"] else None
     # For cases the diagnosis is hidden from the prompt, so hand the grader the
     # reference diagnosis here (grading-only, never stored or shown) — otherwise
@@ -471,6 +707,14 @@ def answer_pending(user_id: str, answer: str) -> dict | None:
         )
         conn.execute("UPDATE pending_questions SET answered_at=? WHERE id=?",
                      (now, row["id"]))
+
+    # Refresh the dashboard snapshot now that mastery moved (best-effort — a
+    # missing static dir or any failure must never break grading).
+    try:
+        from ..dashboard.snapshot import write_snapshot
+        write_snapshot()
+    except Exception:
+        log.exception("dashboard snapshot refresh failed")
 
     remaining = open_questions(user_id)
     return {

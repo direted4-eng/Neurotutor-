@@ -60,6 +60,7 @@ class SessionState:
     persona:   str = "corvin"   # corvin|lin|plain
     step:      int = 0          # счётчик шагов (для многошаговых режимов)
     history:   list[dict] = field(default_factory=list)
+    case_final: bool = False    # кейс переведён в режим финального ответа
     updated_at: str = ""
 
 
@@ -242,11 +243,15 @@ if TELEGRAM_USER:
 
 
 def send_telegram(text: str, disable_notification: bool = False,
-                  reply_markup: dict | None = None) -> bool:
-    """Отправить сообщение пользователю через Telegram Bot API."""
+                  reply_markup: dict | None = None) -> int | None:
+    """Отправить сообщение пользователю через Telegram Bot API.
+
+    Возвращает message_id отправленного сообщения (truthy при успехе) или
+    None при ошибке. message_id нужен, чтобы привязать ответ-reply ученика к
+    КОНКРЕТНОМУ вопросу (см. reply-привязку в handle_message)."""
     if not TELEGRAM_TOKEN:
         log.warning("TELEGRAM_BOT_TOKEN не задан, пропускаю отправку")
-        return False
+        return None
     user = TELEGRAM_USER or os.getenv("TELEGRAM_USER_ID", "")
     payload = {
         "chat_id":    user,
@@ -262,13 +267,14 @@ def send_telegram(text: str, disable_notification: bool = False,
             json=payload,
             timeout=10,
         )
-        ok = r.json().get("ok", False)
-        if not ok:
+        data = r.json()
+        if not data.get("ok"):
             log.error("telegram send failed: %s", r.text)
-        return ok
+            return None
+        return data.get("result", {}).get("message_id")
     except Exception:
         log.exception("telegram send error")
-        return False
+        return None
 
 
 def send_telegram_document(filename: str, content: "str | bytes",
@@ -414,15 +420,24 @@ KIND_LABELS = {
 }
 
 
-def _format_question(q: dict, idx: int | None = None, total: int | None = None) -> str:
+def _format_question(q: dict, queue_total: int | None = None) -> str:
     kind = q.get("kind", "recall")
     label = KIND_LABELS.get(kind, "❓ Вопрос")
     if kind == "recall":
         label += f" · {BLOOM_RU.get(q.get('bloom_level', 1), '')}"
     head = f"<b>{label}</b>"
-    if idx is not None and total is not None:
-        head += f"  <i>({idx}/{total})</i>"
-    return f"{head}\n\n{q['prompt']}\n\n<i>Ответь текстом — я оценю.</i>"
+    # Честный счётчик: сколько вопросов ещё в очереди (раньше всегда было «1/N»
+    # — нельзя было отличить вопросы друг от друга).
+    if queue_total and queue_total > 1:
+        head += f"  <i>(в очереди: {queue_total})</i>"
+    if kind == "case":
+        foot = ("<i>Можешь запрашивать находки: «оцени по Hunt-Hess», "
+                "«результат КТ?», «лаб?». Когда готов поставить диагноз — "
+                "напиши <b>заключение</b> (или «заключение: …»).</i>")
+    else:
+        foot = ("<i>Ответь текстом — я оценю. Если вопросов несколько — "
+                "ответь <b>reply</b> на нужный, чтобы оценил именно его.</i>")
+    return f"{head}\n\n{q['prompt']}\n\n{foot}"
 
 
 def _send_next_question(user_id: str | int) -> bool:
@@ -430,7 +445,19 @@ def _send_next_question(user_id: str | int) -> bool:
     pend = drill.open_questions(str(user_id))
     if not pend:
         return False
-    send_telegram(_format_question(pend[0], 1, len(pend)))
+    # Reset the case "final answer" flag whenever a fresh question is delivered
+    # (cron drill, next-in-batch, …). Otherwise a stale True from an abandoned
+    # case would make the first exploratory message on the NEW case get graded
+    # as the final answer instead of treated as a workup request.
+    state = load_session(user_id)
+    if state.case_final:
+        state.case_final = False
+        save_session(user_id, state)
+    mid = send_telegram(_format_question(pend[0], queue_total=len(pend)),
+                        reply_markup=_case_markup(pend[0]))
+    # Запоминаем, каким сообщением доставлен вопрос — чтобы ответ-reply на него
+    # оценивался именно как ответ на ЭТОТ вопрос, а не на самый старый в очереди.
+    drill.set_question_message(pend[0]["id"], mid)
     return True
 
 
@@ -448,6 +475,31 @@ MODE_MENU = [
 # что открывает меню режимов
 MODE_MENU_TRIGGERS = {"/mode", "/menu", "/start", "режим", "режимы",
                       "меню", "старт", "выбор режима", "тренировка"}
+
+# кнопка «финальный ответ» для кейса (то же, что и слово «заключение»)
+CASE_FINAL_BTN = {"inline_keyboard": [[
+    {"text": "✅ Заключение (финальный ответ)", "callback_data": "case_final"}]]}
+
+
+def _case_markup(q: dict) -> dict | None:
+    """Кнопку финала вешаем только на кейсы (у них интерактивная фаза)."""
+    return CASE_FINAL_BTN if q.get("kind") == "case" else None
+
+
+# триггер финального ответа в кейсе: «заключение», «заключение: …», «мой диагноз».
+# Узко — только то, что мы сами афишируем в подсказке/на кнопке. Раньше сюда
+# попадали слишком общие «итог»/«мой ответ» и съедали обычный текст разбора
+# («итог обследования…» трактовался как финальный ответ).
+FINAL_RE = re.compile(
+    r"^\s*(?:это\s+|вот\s+)?(?:мо[йёе]\s+)?"
+    r"(?:заключение|заключаю|мой\s+диагноз|ставлю\s+диагноз|"
+    r"(?:финальн\w*|заключительн\w*|итоговый)\s+ответ)\b[\s:.\-—]*(.*)$",
+    re.IGNORECASE | re.DOTALL)
+
+# выход из режима финала обратно в интерактивный разбор кейса
+CANCEL_RE = re.compile(
+    r"^\s*(?:отмена|назад|стоп|погоди|подожди|продолж\w*)\b",
+    re.IGNORECASE)
 
 # явный запрос конспекта: «конспект по аневризмам», «сделай теорию о шунтах»
 CONSPECT_RE = re.compile(
@@ -503,11 +555,26 @@ def answer_callback_query(callback_id: str) -> None:
 
 
 def handle_callback(data: str, user_id: str | int) -> None:
-    """Обработать нажатие инлайн-кнопки выбора режима."""
+    """Обработать нажатие инлайн-кнопки (выбор режима / финал кейса)."""
+    # «✅ Заключение» — перевести открытый кейс в режим финального ответа.
+    if data == "case_final":
+        if not drill.has_open(str(user_id)):
+            send_telegram("Сейчас нет открытого кейса.")
+            return
+        state = load_session(user_id)
+        state.case_final = True
+        save_session(user_id, state)
+        send_telegram("✍️ Пиши заключение: дифдиагноз, план обследования, тактика.")
+        return
+
     if not data.startswith("mode:"):
         return
     kind = data.split(":", 1)[1]
     label = KIND_LABELS.get(kind, kind)
+    # новый вопрос → сбрасываем флаг финала прошлого кейса
+    state = load_session(user_id)
+    state.case_final = False
+    save_session(user_id, state)
     send_telegram(f"🎯 Режим: <b>{label}</b>. Готовлю вопрос…",
                   disable_notification=True)
     q = drill.generate_one(str(user_id), kind)
@@ -515,7 +582,10 @@ def handle_callback(data: str, user_id: str | int) -> None:
         send_telegram("Не удалось собрать вопрос этого типа — попробуй другой "
                       "режим (/mode).")
         return
-    send_telegram(_format_question(q, 1, 1))
+    queue_total = len(drill.open_questions(str(user_id)))
+    mid = send_telegram(_format_question(q, queue_total=queue_total),
+                        reply_markup=_case_markup(q))
+    drill.set_question_message(q["id"], mid)
 
 
 def send_drill(n: int = 3) -> None:
@@ -531,6 +601,30 @@ def send_drill(n: int = 3) -> None:
         send_telegram(
             f"🧠 <b>Разбор дня</b>: {len(created)} задани(й).\n<i>{kinds}</i>\n"
             "Отвечай по одному 👇", disable_notification=True)
+    _send_next_question(uid)
+
+
+def send_reminder() -> None:
+    """Вечернее напоминание о неотвеченных вопросах дня (для крона).
+
+    Молчит, если открытых вопросов нет (никакого пустого спама). Сначала
+    отрабатывает TTL — про уже истёкшие вопросы не напоминаем.
+    """
+    uid = TELEGRAM_USER or os.getenv("TELEGRAM_USER_ID", "")
+    if not uid:
+        log.error("TELEGRAM_USER_ID не задан — некому слать напоминание")
+        return
+    drill.expire_stale(str(uid))
+    pend = drill.open_questions(str(uid))
+    if not pend:
+        log.info("reminder: открытых вопросов нет, молчу")
+        return
+    send_telegram(
+        f"⏰ Висит без ответа: <b>{len(pend)}</b> вопрос(а) дня. "
+        "Неотвеченные сгорают через 48 ч и заменяются новыми.\n"
+        "<i>Можно ответить сейчас, «пропусти» — следующий, "
+        "«сбрось вопросы» — очистить очередь.</i>",
+        disable_notification=True)
     _send_next_question(uid)
 
 
@@ -560,16 +654,72 @@ def send_report() -> None:
         send_telegram(msg, disable_notification=True)
 
 
-def _handle_drill_answer(user_id: str, text: str) -> None:
-    """Оценить ответ на висящий вопрос, прислать фидбек и следующий вопрос."""
-    fb = drill.answer_pending(user_id, text)
+def _handle_evening_report(text: str) -> None:
+    """Парсит свободный отчёт за день и пишет в daily_logs.
+
+    Голосовое о дне: «сделал X, застрял на Y, завтра Z, энергия 7/10».
+    Триггеры обрабатываются в handle_message.
+    """
+    import subprocess
+    handler = "/root/.hermes/scripts/evening_report_handler.py"
+    try:
+        result = subprocess.run(
+            ["python3", handler, "--text", text, "--quiet"],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0:
+            send_telegram(
+                "✅ <b>Отчёт записан в daily_logs.</b>\n\n"
+                "📌 Что сделал — сохранил\n"
+                "🚧 Застрял — записал\n"
+                "📋 Завтра — в плане\n\n"
+                "Хочешь посмотреть весь лог за неделю — скажи «покажи неделю»."
+            )
+        else:
+            log.error(f"evening_report failed: {result.stderr}")
+            send_telegram("⚠️ Не смог распарсить отчёт. Скажи ещё раз чуть короче.")
+    except Exception:
+        log.exception("evening_report crash")
+        send_telegram("⚠️ Ошибка парсера. Запишу вручную.")
+
+
+def _question_quote(fb: dict) -> str:
+    """Короткая однострочная цитата оцениваемого вопроса для фидбека.
+
+    Без неё ученик не видел, на какой вопрос пришла оценка, и она казалась
+    ответом «не на то сообщение». С цитатой связка «вопрос ↔ оценка» очевидна.
+    """
+    q_txt = (fb.get("question") or "").strip().replace("\n", " ")
+    q_txt = re.sub(r"\s{2,}", " ", q_txt)
+    # для кейса выкидываем служебный префикс «Клинический случай.»
+    q_txt = re.sub(r"^Клинический случай\.?\s*", "", q_txt)
+    if not q_txt:
+        return ""
+    if len(q_txt) > 90:
+        q_txt = q_txt[:90].rstrip() + "…"
+    return f"📝 <i>Оценка по вопросу:</i> «{q_txt}»\n\n"
+
+
+def _handle_drill_answer(user_id: str, text: str, qid: int | None = None) -> None:
+    """Оценить ответ на висящий вопрос, прислать фидбек и следующий вопрос.
+
+    qid задаёт КОНКРЕТНЫЙ вопрос (reply-привязка); без него оценивается самый
+    старый открытый. Если по reply вопрос уже закрыт — мягкий откат к старому.
+    """
+    fb = (drill.answer_specific(user_id, qid, text) if qid is not None
+          else None)
+    if fb is None:
+        fb = drill.answer_pending(user_id, text)
     if fb is None:
         return
 
+    quote = _question_quote(fb)
+
     # Грейдер не смог разобрать ответ — вопрос остался открытым, просим повторить.
     if fb.get("ungraded"):
-        send_telegram("⚠️ Не смог корректно оценить ответ (сбой парсинга). "
-                      "Вопрос остался открытым — попробуй переформулировать.")
+        send_telegram(quote + "⚠️ Не смог корректно оценить ответ (сбой "
+                      "парсинга). Вопрос остался открытым — попробуй "
+                      "переформулировать.")
         _send_next_question(user_id)
         return
 
@@ -578,7 +728,7 @@ def _handle_drill_answer(user_id: str, text: str) -> None:
     mark = "✅" if (score or 0) >= 0.7 else ("🟡" if (score or 0) >= 0.4 else "❌")
     tail = ("\n\n<i>Следующее повторение запланировано.</i>"
             if fb.get("next_review") else "")
-    msg = f"{mark} <b>Оценка: {pct}</b>\n\n{fb.get('feedback','').strip()}{tail}"
+    msg = f"{quote}{mark} <b>Оценка: {pct}</b>\n\n{fb.get('feedback','').strip()}{tail}"
     send_telegram(msg)
 
     # Кейс: диагноз скрывался в вопросе — теперь, после ответа, раскрываем его.
@@ -619,6 +769,29 @@ def handle_message(raw: dict, user_id: str | int) -> None:
 
     state = load_session(user_id)
     routing, persona_hint = route(text)
+
+    # Reply-привязка: если ученик ответил Telegram-reply'ем на конкретный вопрос,
+    # узнаём его id и тип — дальше оцениваем/ведём ИМЕННО его, а не самый старый
+    # в очереди. Это и есть лечение «отвечает не на то сообщение».
+    reply_qid = reply_kind = None
+    reply_mid = raw.get("reply_to_message_id")
+    if reply_mid:
+        rq = drill.open_question_by_message(str(user_id), reply_mid)
+        if rq:
+            reply_qid, reply_kind = rq["id"], rq["kind"]
+
+    # Пока открыт клинический кейс, сообщение принадлежит кейсу: запрос находки
+    # («результат МРТ?») или финальный ответ («…МРТ — измерение желудочков») НЕ
+    # должны перекидывать сессию в режим imaging/new по случайному ключевому слову
+    # — иначе сообщение минует case_followup / оценку. Сброс и смену персонажа
+    # оставляем рабочими.
+    _open = drill.open_questions(str(user_id))
+    _active_is_case = (reply_kind == "case") if reply_qid is not None else (
+        bool(_open) and _open[0].get("kind") == "case")
+    if _active_is_case and routing in (
+            "diagnostic", "review", "case", "osce", "imaging", "new"):
+        routing = ""
+
     state = apply_route(state, routing, persona_hint)
 
     if routing == "reset":
@@ -631,6 +804,53 @@ def handle_message(raw: dict, user_id: str | int) -> None:
     if any(kw in low for kw in ("отчёт", "отчет", "прогресс", "компетенц",
                                  "карта знаний", "мои пробелы", "/report")):
         send_report()
+        return
+
+    # Свободный отчёт за день → парсер в daily_logs.
+    # Триггеры: "сделал сегодня", "дневной отчёт", "отчитаться", "за день",
+    # "/day". Это приоритетнее RAG/кейсов — голосовое о дне не должно
+    # ломаться на «сделал» / «выучил» / «прочитал» внутри кейса.
+    if any(kw in low for kw in ("сделал сегодня", "дневной отчёт", "дневной отчет",
+                                 "отчитаться", "за день", "/day",
+                                 "отчет за день", "отчёт за день")):
+        _handle_evening_report(text)
+        return
+
+    # Калибровка: по одному базовому вопросу на каждый домен программы —
+    # засеивает карту компетенций реальным уровнем (холодный старт).
+    if re.match(r"^\s*(/calibrate|калибровк\w*)\b", low):
+        send_telegram("🧭 Готовлю калибровку: по одному вопросу на каждый из "
+                      "14 разделов программы (~2 мин). Текущая очередь "
+                      "вопросов сброшена.", disable_notification=True)
+        created = drill.generate_calibration(str(user_id))
+        if not created:
+            send_telegram("Не удалось собрать калибровку — попробуй позже.")
+            return
+        send_telegram(f"🧭 <b>Калибровка</b>: {len(created)} вопрос(ов), по "
+                      "одному на раздел. Отвечай как можешь — «не знаю» тоже "
+                      "ответ, это разметка карты, а не экзамен. Можно "
+                      "«пропусти». Поехали 👇", disable_notification=True)
+        _send_next_question(user_id)
+        return
+
+    # Управление очередью вопросов: «пропусти» — сжечь текущий и дать
+    # следующий; «сбрось вопросы» — очистить очередь целиком. Без этого
+    # неудобный вопрос блокировал всю петлю до TTL.
+    if re.match(r"^\s*(пропусти(ть)?|скип|skip)\b", low):
+        pend = drill.open_questions(str(user_id))
+        if not pend:
+            send_telegram("Открытых вопросов нет. Открыть меню — «режим».")
+            return
+        drill.skip_first(str(user_id))
+        send_telegram("⏭ Пропустил (без оценки).", disable_notification=True)
+        if not _send_next_question(user_id):
+            send_telegram("Очередь пуста. Новый вопрос — через «режим» "
+                          "или завтра в утреннем разборе.")
+        return
+    if re.match(r"^\s*(сбрось|сбросить|очисти(ть)?)\s+(вопрос|очеред)", low):
+        n = drill.expire_all_open(str(user_id))
+        send_telegram(f"🧹 Очередь очищена ({n} вопрос(а) снято, без оценки). "
+                      "Новый вопрос — «режим», или жди утренний разбор.")
         return
 
     # Явный запрос конспекта по теме → собрать и прислать PDF из RAG.
@@ -658,8 +878,51 @@ def handle_message(raw: dict, user_id: str | int) -> None:
 
     # Если у пользователя висит вопрос дня и это не явная смена режима —
     # трактуем сообщение как ответ на него (замкнутая петля).
-    if not routing and drill.has_open(str(user_id)):
-        _handle_drill_answer(str(user_id), text)
+    open_qs = drill.open_questions(str(user_id))
+    if not routing and open_qs:
+        # На какой вопрос отвечаем: reply → конкретный; иначе самый старый.
+        # active_qid=None означает «самый старый» — точное прежнее поведение.
+        if reply_qid is not None:
+            active_kind, active_qid = reply_kind, reply_qid
+        else:
+            active_kind, active_qid = open_qs[0].get("kind"), None
+        # Кейс ведётся интерактивно: запросы находок/шкал — пока не сказано
+        # «заключение». Так ординатор сам ставит диагноз, а не получает подсказку.
+        if active_kind == "case":
+            # Передумал ставить заключение → назад в интерактивный разбор.
+            if state.case_final and CANCEL_RE.match(text):
+                state.case_final = False
+                save_session(user_id, state)
+                send_telegram("↩️ Ок, продолжаем разбор. Запрашивай находки "
+                              "или напиши «заключение», когда будешь готов.")
+                return
+            m_fin = FINAL_RE.match(text)
+            if m_fin:
+                rest = m_fin.group(1).strip()
+                if rest:                       # «заключение: <разбор>» → сразу оценка
+                    state.case_final = False
+                    save_session(user_id, state)
+                    _handle_drill_answer(str(user_id), rest, qid=active_qid)
+                    return
+                state.case_final = True        # «заключение» отдельно → ждём разбор
+                save_session(user_id, state)
+                send_telegram("✍️ Пиши заключение: дифдиагноз, план "
+                              "обследования, тактика.")
+                return
+            if not state.case_final:           # исследовательский запрос по кейсу
+                reply = drill.case_followup(str(user_id), text, qid=active_qid)
+                body = reply or ("Не понял запрос — уточни (шкала? "
+                                 "обследование?).")
+                # Кнопка финала висит на КАЖДОМ шаге разбора: оценку можно
+                # запустить в один тап, не угадывая слово-триггер.
+                send_telegram(
+                    body + "\n\n<i>Готов? Жми «✅ Заключение» или напиши "
+                    "«заключение: …».</i>",
+                    reply_markup=CASE_FINAL_BTN)
+                return
+            state.case_final = False           # был режим финала → это и есть ответ
+            save_session(user_id, state)
+        _handle_drill_answer(str(user_id), text, qid=active_qid)
         return
 
     # строим history для CLI
@@ -742,8 +1005,11 @@ def main() -> None:
                 if not text:
                     continue
 
-                log.info("→ [%s] %s", msg_from or "?", text[:60])
-                handle_message({"text": text, "id": msg.get("message_id")},
+                reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+                log.info("→ [%s] %s%s", msg_from or "?", text[:60],
+                         f" (reply→{reply_to})" if reply_to else "")
+                handle_message({"text": text, "id": msg.get("message_id"),
+                                "reply_to_message_id": reply_to},
                                user_id=msg_from or 0)
 
         except requests.exceptions.Timeout:
@@ -765,6 +1031,8 @@ if __name__ == "__main__":
         send_digest(days)
     elif arg == "--report":
         send_report()
+    elif arg == "--remind":
+        send_reminder()
     elif arg == "--menu":
         send_mode_menu()
     elif arg == "--theory":
