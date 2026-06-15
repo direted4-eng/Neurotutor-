@@ -58,12 +58,26 @@ def cursor() -> Iterator[sqlite3.Cursor]:
         conn.close()
 
 
+# Canonical competency domains, aligned to the consolidated neurosurgery
+# residency curriculum (sections A–M of the EANS/ABNS/ФГОС synthesis) plus a
+# cross-cutting "approaches" bucket for scenario op-step drills.
+# §A folds neuroanatomy + basic neurosciences; legacy codes pathology/clinical
+# were retired and their content remapped (see seed/migrate_curriculum.py).
 DOMAINS = [
-    ("anatomy", "Нейроанатомия", 0.90),
-    ("pathology", "Нейропатология и патофизиология", 0.85),
-    ("radiology", "Нейрорадиология", 0.85),
-    ("clinical", "Клиника и менеджмент", 0.85),
-    ("approaches", "Хирургические доступы", 0.80),
+    ("anatomy", "Базовые нейронауки (анатомия, физиология, патология)", 0.90),  # §A
+    ("radiology", "Диагностика и нейровизуализация", 0.85),                     # §B
+    ("vascular", "Сосудистая нейрохирургия", 0.85),                             # §C
+    ("oncology", "Нейроонкология, основание черепа и гипофиз", 0.85),           # §D
+    ("spine", "Спинальная нейрохирургия", 0.85),                               # §E
+    ("trauma", "Нейротравматология", 0.85),                                     # §F
+    ("functional", "Функциональная нейрохирургия, эпилепсия и боль", 0.80),     # §G
+    ("pediatric", "Педиатрическая нейрохирургия", 0.80),                        # §H
+    ("hydrocephalus", "Гидроцефалия и патология ликворных путей", 0.85),        # §I
+    ("peripheral_nerve", "Хирургия периферических нервов", 0.80),               # §J
+    ("infection", "Инфекции и воспалительные заболевания ЦНС", 0.85),           # §K
+    ("neurocritical", "Нейрореанимация, нейроанестезия и мониторинг", 0.85),    # §L
+    ("professional", "Общепрофессиональные и академические компетенции", 0.75), # §M
+    ("approaches", "Хирургические доступы и оперативная техника", 0.80),
 ]
 
 

@@ -67,6 +67,25 @@ def build_report() -> dict:
                FROM responses WHERE grade IS NOT NULL
                GROUP BY role ORDER BY n DESC""").fetchall()]
 
+        # Program-wide progress: each concept is "touched" once any Bloom level
+        # has a graded review, and "mastered" once its mean reviewed mastery
+        # reaches its domain's target. Untouched concepts have avg_m = NULL, so
+        # the `>= tgt` test is false for them (NULL comparison) — as intended.
+        program = dict(conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(touched)  AS touched,
+                      SUM(CASE WHEN avg_m >= tgt THEN 1 ELSE 0 END) AS mastered
+               FROM (
+                   SELECT c.id, d.target_mastery AS tgt,
+                          MAX(CASE WHEN m.last_review IS NOT NULL
+                                   THEN 1 ELSE 0 END) AS touched,
+                          AVG(CASE WHEN m.last_review IS NOT NULL
+                                   THEN m.mastery END) AS avg_m
+                   FROM concepts c
+                   JOIN domains d ON d.id = c.domain_id
+                   LEFT JOIN mastery m ON m.concept_id = c.id
+                   GROUP BY c.id)""").fetchone())
+
         total = conn.execute(
             "SELECT COUNT(*) FROM responses WHERE grade IS NOT NULL").fetchone()[0]
         recent = conn.execute(
@@ -77,12 +96,24 @@ def build_report() -> dict:
             "AND created_at >= ? AND created_at < ?", (d14, d7)).fetchone()[0]
 
     return {"domains": domains, "weak": weak, "untouched": untouched,
-            "kinds": kinds, "total_answers": total,
+            "kinds": kinds, "total_answers": total, "program": program,
             "recent_avg": recent, "prior_avg": prior}
 
 
 def _pct(x: float | None) -> str:
     return f"{round((x or 0) * 100)}%" if x is not None else "—"
+
+
+def _bar(done: int, total: int, width: int = 10) -> str:
+    """Ten-cell progress bar; rounds to nearest cell but never shows a full
+    bar unless the count is actually complete."""
+    frac = (done / total) if total else 0.0
+    filled = round(frac * width)
+    if filled == width and done < total:
+        filled = width - 1
+    if filled == 0 and done > 0:
+        filled = 1
+    return "▰" * filled + "▱" * (width - filled)
 
 
 def format_report_telegram() -> str:
@@ -93,6 +124,19 @@ def format_report_telegram() -> str:
                 "пробелов.")
 
     lines = ["📊 <b>Карта компетенций</b>\n"]
+
+    # program-wide progress: headline scale of how much of the whole
+    # neurosurgery program has been touched vs actually mastered.
+    p = r["program"]
+    if p and p["total"]:
+        tot = p["total"]
+        tch = p["touched"] or 0
+        mst = p["mastered"] or 0
+        lines.append("🎓 <b>Освоение программы</b>")
+        lines.append(f"{_bar(tch, tot)}  Затронуто: "
+                     f"<b>{round(tch / tot * 100)}%</b> ({tch}/{tot})")
+        lines.append(f"{_bar(mst, tot)}  Освоено:   "
+                     f"<b>{round(mst / tot * 100)}%</b> ({mst}/{tot})\n")
 
     # trend
     if r["recent_avg"] is not None:
