@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +65,10 @@ TOOL_SCHEMAS: list[dict] = [
                 "properties": {
                     "query": {"type": "string"},
                     "domain": {"type": "string", "enum": [
-                        "anatomy", "pathology", "radiology", "clinical", "approaches"
+                        "anatomy", "radiology", "vascular", "oncology", "spine",
+                        "trauma", "functional", "pediatric", "hydrocephalus",
+                        "peripheral_nerve", "infection", "neurocritical",
+                        "professional", "approaches",
                     ]},
                 },
                 "required": ["query"],
@@ -341,22 +346,76 @@ def _rating_from_score(score: float) -> int:
     return 1
 
 
+# Self-consistency: how many times to sample the grader and aggregate. MiniMax
+# is the only judge available (no stronger cross-check model), so the lever for
+# fairness is VARIANCE REDUCTION — N samples at temp>0, aggregated by median,
+# cancel the run-to-run noise that reads as "unfair". Tunable via env; 1 = the
+# old single deterministic call. Each extra sample is another MiniMax call (more
+# latency + 529 exposure), which is why this ships only after the 529
+# graceful-degrade hardening.
+GRADE_SAMPLES = max(1, int(os.getenv("NEUROTUTOR_GRADE_SAMPLES", "3")))
+_GRADE_SAMPLE_TEMP = 0.35
+
+
+def _normalize_criteria(criteria) -> list[tuple[str, float]]:
+    """Normalize a rubric's criteria into [(name, weight)].
+
+    Accepts plain strings (weight 1.0 — the common case) or dicts carrying an
+    explicit weight ({"name": ..., "weight": ...}), so a rubric can mark core
+    criteria as worth more than peripheral ones without breaking old content.
+    """
+    out: list[tuple[str, float]] = []
+    for c in criteria or []:
+        if isinstance(c, dict):
+            name = str(c.get("name") or c.get("criterion") or "").strip()
+            raw_w = c.get("weight", 1.0)
+        else:
+            name, raw_w = str(c).strip(), 1.0
+        try:
+            w = max(0.0, float(raw_w))
+        except (TypeError, ValueError):
+            w = 1.0
+        if name:
+            out.append((name, w))
+    return out or [("correctness", 1.0)]
+
+
+def _weighted_mean(marks: dict, weighted_criteria: list[tuple[str, float]]):
+    """Weighted mean of per-criterion marks; None if no criterion was marked.
+
+    Equal weights (the default) reduce to a plain mean — identical to the prior
+    behaviour — so existing string rubrics grade exactly as before.
+    """
+    num = den = 0.0
+    for name, w in weighted_criteria:
+        if name in marks and w > 0:
+            num += marks[name] * w
+            den += w
+    return (num / den) if den else None
+
+
 def grade_answer(
     prompt: str,
     answer: str,
     concept_id: int | None = None,
     bloom_level: int | None = None,
     rubric: dict | None = None,
+    samples: int | None = None,
 ) -> dict:
     """Grade with the text model, then ground the score in the rubric.
 
-    The overall score is computed as the mean of the per-criterion marks the
-    model returns (not a free-floating holistic number), and the FSRS rating is
-    derived deterministically from that score. If the model's JSON can't be
-    parsed we return an *ungraded* result (score=None) rather than a fake 0 —
-    so a parser hiccup never corrupts mastery with a phantom lapse.
+    The overall score is a WEIGHTED mean of per-criterion marks (not a
+    free-floating holistic number); equal weights reduce to a plain mean. To
+    damp MiniMax's run-to-run dispersion — the noise that reads as unfair — the
+    grader is sampled `samples` times (default GRADE_SAMPLES) at temp>0 and each
+    criterion's marks are aggregated by MEDIAN before the weighted mean. The
+    FSRS rating is derived deterministically from the final score. If NO sample
+    yields parseable JSON we return an *ungraded* result (score=None) rather
+    than a fake 0 — a parser hiccup never corrupts mastery with a phantom lapse.
     """
     from ..llm.minimax import MiniMaxClient, extract_text
+
+    n_samples = GRADE_SAMPLES if samples is None else max(1, int(samples))
 
     default_rubric = {
         1: ["factual_correctness", "completeness"],
@@ -366,8 +425,14 @@ def grade_answer(
         5: ["evidence_quality", "trade_off_analysis"],
         6: ["originality", "feasibility"],
     }
-    criteria = (rubric and rubric.get("criteria")) or \
-               default_rubric.get(bloom_level or 1, ["correctness"])
+    raw_criteria = (rubric and rubric.get("criteria")) or \
+        default_rubric.get(bloom_level or 1, ["correctness"])
+    weighted_criteria = _normalize_criteria(raw_criteria)
+    criteria = [name for name, _ in weighted_criteria]   # names shown to the model
+
+    # A single deterministic pass keeps cost minimal; multiple passes need temp>0
+    # to actually diversify, otherwise the samples are near-identical.
+    temperature = 0.0 if n_samples <= 1 else _GRADE_SAMPLE_TEMP
 
     client = MiniMaxClient()
     try:
@@ -405,37 +470,72 @@ def grade_answer(
         )
         user = json.dumps({"prompt": prompt, "answer": answer,
                            "criteria": criteria}, ensure_ascii=False)
-        resp = client.chat(
-            [{"role": "system", "content": sys},
-             {"role": "user", "content": user}],
-            temperature=0.0,
-        )
-        text = extract_text(resp)
+        msgs = [{"role": "system", "content": sys},
+                {"role": "user", "content": user}]
+        parsed_samples: list[dict] = []
+        last_text = ""
+        for _ in range(n_samples):
+            last_text = extract_text(client.chat(msgs, temperature=temperature))
+            parsed = _parse_json_loose(last_text)
+            if parsed is not None:
+                parsed_samples.append(parsed)
     finally:
         client.close()
 
-    result = _parse_json_loose(text)
-    if result is None:
-        log.warning("grade_answer: failed to parse JSON; raw response: %r", text[:500])
-        return {"score": None, "breakdown": {}, "feedback": text[:500].strip(),
+    # No sample parsed → ungraded (never a fake 0): a transient parser/model
+    # hiccup must not write a phantom lapse into mastery.
+    if not parsed_samples:
+        log.warning("grade_answer: no parseable sample; last raw: %r", last_text[:500])
+        return {"score": None, "breakdown": {}, "feedback": last_text[:500].strip(),
                 "suggested_rating": None, "parse_error": True,
-                "concept_id": concept_id, "bloom_level": bloom_level}
+                "concept_id": concept_id, "bloom_level": bloom_level,
+                "samples_used": 0}
 
-    breakdown = result.get("breakdown") or {}
-    marks = [float(v) for v in breakdown.values()
-             if isinstance(v, (int, float))]
-    if marks:
-        score = sum(marks) / len(marks)
-    else:
-        raw = result.get("score")
-        score = float(raw) if isinstance(raw, (int, float)) else 0.0
+    # Aggregate per-criterion marks across samples by MEDIAN (robust to a single
+    # outlier sample), then take the weighted mean over the rubric.
+    per_criterion: dict[str, list[float]] = {name: [] for name in criteria}
+    holistic: list[float] = []
+    for r in parsed_samples:
+        bd = r.get("breakdown") or {}
+        for name in criteria:
+            v = bd.get(name)
+            if isinstance(v, (int, float)):
+                per_criterion[name].append(float(v))
+        h = r.get("score")
+        if isinstance(h, (int, float)):
+            holistic.append(float(h))
+
+    median_marks = {name: statistics.median(vs)
+                    for name, vs in per_criterion.items() if vs}
+    score = _weighted_mean(median_marks, weighted_criteria)
+    if score is None:
+        # Model gave no per-criterion marks in any sample — fall back to the
+        # median of its holistic score field, else 0.
+        score = statistics.median(holistic) if holistic else 0.0
     score = max(0.0, min(1.0, score))
 
-    result["score"] = score
-    result["suggested_rating"] = _rating_from_score(score)
-    result["concept_id"] = concept_id
-    result["bloom_level"] = bloom_level
-    return result
+    # Representative feedback: from the sample whose own weighted score is
+    # closest to the aggregate, so the prose matches the mark the student sees.
+    def _sample_score(r: dict) -> float:
+        bd = r.get("breakdown") or {}
+        m = {n: float(bd[n]) for n in criteria
+             if isinstance(bd.get(n), (int, float))}
+        s = _weighted_mean(m, weighted_criteria)
+        if s is None:
+            s = r.get("score") if isinstance(r.get("score"), (int, float)) else score
+        return float(s)
+
+    representative = min(parsed_samples, key=lambda r: abs(_sample_score(r) - score))
+
+    return {
+        "score": score,
+        "breakdown": median_marks,
+        "feedback": representative.get("feedback", ""),
+        "suggested_rating": _rating_from_score(score),
+        "concept_id": concept_id,
+        "bloom_level": bloom_level,
+        "samples_used": len(parsed_samples),
+    }
 
 
 def schedule_fsrs(concept_id: int, bloom_level: int, rating: int) -> dict:
