@@ -42,6 +42,10 @@ PUBMED_EMAIL=you@example.com    # NCBI требует контактный email
 - `PUBMED_API_KEY` — поднимает лимит NCBI с 3/с до 10/с
 - `NEUROTUTOR_DB`, `NEUROTUTOR_RAG_DIR` — кастомные пути
 - `MINIMAX_TEXT_MODEL` / `MINIMAX_VISION_MODEL` / `MINIMAX_EMBED_MODEL`
+- `NEUROTUTOR_GRADE_SAMPLES` — сколько раз семплировать грейдер для
+  self-consistency (медиана по критериям гасит разброс MiniMax). По умолчанию
+  `3`; `1` — старое поведение (один детерминированный вызов, дешевле/быстрее).
+- `NEUROTUTOR_DASHBOARD_JSON` — путь для снапшота карты компетенций (дашборд)
 
 ## Первый запуск
 
@@ -139,11 +143,41 @@ neurotutor/
     └── classifications.json
 ```
 
+## Тесты
+
+Юнит-тесты — герметичные: временная БД, замоканный MiniMax, **без сети** и
+**без касания** живой `data/neurotutor.sqlite`. Запуск:
+
+```bash
+./run_tests.sh           # весь набор
+./run_tests.sh -v        # подробно
+./run_tests.sh tests.test_grading   # один модуль
+```
+
+Скрипт экспортирует временный `NEUROTUTOR_DB` в окружение **до** старта Python,
+поэтому конфиг физически не может срезолвиться на прод-БД. Покрыто: маршрутизация
+(`route` + регэкспы-триггеры), `_strip_scales`, агрегация и parse-error в
+`grade_answer`, маппинг score→FSRS, HTML-экранирование, graceful-degrade на 529
+и переоценка отложенных ответов. CI — `.github/workflows/tests.yml`.
+
+## Деплой
+
+Не править рабочую копию вживую — катить из git с тест-гейтом:
+
+```bash
+deploy/update.sh         # git pull → deps → миграция → ./run_tests.sh → restart
+```
+
+Тесты — гейт: красный набор блокирует рестарт бота. Сервис —
+`neurotutor-bot.service`, расписание — `deploy/neurotutor.cron`
+(включая `--regrade` бэкстоп для отложенных из-за перегрузки оценок).
+
 ## Статус
 
-Ранняя стадия. Архитектура зафиксирована, ядро работает, но:
-- seed концептов мал (расширяется по мере использования)
-- нужен ingest учебников локально, в репо их нет
-- тесты в работе
+Ядро работает; замкнутая петля (drill → grade → FSRS) — основной сценарий.
+- учебный контент расширен до полной программы A–M (~170 концептов, см.
+  `seed/curriculum.json` + `seed/migrate_curriculum.py`)
+- надёжность: HTML-экранирование, graceful-degrade на 529, юнит-тесты + CI
+- RAG требует локального ingest учебников (в репо их нет)
 
 См. issues для текущих задач.
