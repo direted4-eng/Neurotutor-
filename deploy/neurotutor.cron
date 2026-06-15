@@ -21,6 +21,10 @@
 # Weekly competency report (gaps, weak spots, trend).  Sunday 19:00 MSK
 0 16 * * 0 cd /root/neurotutor && venv/bin/python tg_handler.py --report >> data/cron.log 2>&1
 
+# Evening report prompt: ask the user for a free-form day recap, which
+# tg_handler._handle_evening_report parses into daily_logs.  22:00 MSK
+0 19 * * * /bin/bash -c 'set -a; source /root/neurotutor/.env; set +a; curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d "chat_id=5939020075" -d "text=🗣 Вечерний отчёт. Скажи голосовым свободным рассказом: что сделал, где застрял, план на завтра, энергия X/10 — запишу в daily_logs. Триггеры: сделал сегодня / дневной отчёт / /day" -d "parse_mode=HTML" >/dev/null 2>&1'
+
 # Dashboard snapshot backstop: grading already refreshes study.json after every
 # answer; this hourly run guarantees the Live-maps dashboard still updates if the
 # static dir was unmounted during a grade, and seeds it on first deploy. Silent
