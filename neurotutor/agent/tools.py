@@ -16,6 +16,7 @@ import os
 import random
 import re
 import statistics
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -472,15 +473,26 @@ def grade_answer(
                            "criteria": criteria}, ensure_ascii=False)
         msgs = [{"role": "system", "content": sys},
                 {"role": "user", "content": user}]
-        parsed_samples: list[dict] = []
-        last_text = ""
-        for _ in range(n_samples):
-            last_text = extract_text(client.chat(msgs, temperature=temperature))
-            parsed = _parse_json_loose(last_text)
-            if parsed is not None:
-                parsed_samples.append(parsed)
+
+        def _one_sample(_ignored=None) -> str:
+            return extract_text(client.chat(msgs, temperature=temperature))
+
+        if n_samples == 1:
+            texts = [_one_sample()]
+        else:
+            # Fire the self-consistency samples CONCURRENTLY. Sequential N× calls
+            # made a grade take ~N×12s on MiniMax (a silent wait after answering);
+            # httpx.Client is thread-safe, so parallel keeps latency near a single
+            # call. An unrecoverable sample (529 after retries) propagates here →
+            # the caller's degrade path stashes the answer for --regrade.
+            with ThreadPoolExecutor(max_workers=n_samples) as ex:
+                texts = list(ex.map(_one_sample, range(n_samples)))
     finally:
         client.close()
+
+    parsed_samples = [p for p in (_parse_json_loose(t) for t in texts)
+                      if p is not None]
+    last_text = texts[-1] if texts else ""
 
     # No sample parsed → ungraded (never a fake 0): a transient parser/model
     # hiccup must not write a phantom lapse into mastery.

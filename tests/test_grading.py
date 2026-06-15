@@ -5,6 +5,7 @@ run with no network and pin: score = mean of per-criterion marks, deterministic
 FSRS rating, and the ungraded (parse-error) path that must NOT fabricate a 0.
 """
 import json
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -26,14 +27,17 @@ class FakeClient:
 
 class CyclingClient:
     """Returns a different canned content on each successive .chat() call —
-    lets a test exercise self-consistency across genuinely differing samples."""
+    lets a test exercise self-consistency across genuinely differing samples.
+    Thread-safe: grade_answer fires the samples concurrently."""
     def __init__(self, contents):
         self._contents = list(contents)
         self._i = 0
+        self._lock = threading.Lock()
 
     def chat(self, *args, **kwargs):
-        c = self._contents[self._i % len(self._contents)]
-        self._i += 1
+        with self._lock:
+            c = self._contents[self._i % len(self._contents)]
+            self._i += 1
         return {"choices": [{"message": {"content": c}}]}
 
     def close(self):
