@@ -16,6 +16,8 @@ Stateful Telegram-интеграция для Neurotutor.
 
 from __future__ import annotations
 
+import functools
+import html
 import json
 import logging
 import os
@@ -114,7 +116,21 @@ OSCE_KW        = {"оскэ", "экзамен", "станция", "осцэ", "/
 IMAGING_KW    = {"кт", "мрт", "снимок", "ангио", "imaging", "кт/мрт"}
 NEW_KW        = {"объясни", "расскажи", "новое", "новый", "что такое", "давай учить"}
 CORVIN_KW     = {"персонаж корвин", "корвин", "профессор", "/corvin"}
-LIN_KW        = {"персонаж линь", "лин", "май линь", "/lin"}
+# NB: персонаж — «Линь». Раньше ключевик был «лин» (без «ь») и матчился как
+# подстрока внутри «к-лин-ический», «лин-ия» и т.п. → ложный persona:lin.
+LIN_KW        = {"персонаж линь", "линь", "май линь", "/lin"}
+
+
+@functools.lru_cache(maxsize=1024)
+def _kw_pattern(kw: str) -> re.Pattern:
+    # Левая граница слова: совпадение должно НАЧИНАТЬСЯ на стыке слов, но может
+    # продолжаться внутрь слова — так «повтори» всё ещё ловит «повторить», а
+    # «лин»/«кт» больше НЕ цепляются изнутри «клинический»/«контакт».
+    return re.compile(r"(?<!\w)" + re.escape(kw))
+
+
+def _has_kw(t: str, kws: set[str]) -> bool:
+    return any(_kw_pattern(kw).search(t) for kw in kws)
 
 
 def route(text: str) -> tuple[str, str]:
@@ -122,27 +138,27 @@ def route(text: str) -> tuple[str, str]:
     t = text.lower().strip()
 
     # сначала сброс — он важнее всего
-    if any(p in t for p in RESET_PHRASES):
+    if _has_kw(t, RESET_PHRASES):
         return "reset", ""
 
     # персонажи (не меняют mode)
-    if any(p in t for p in CORVIN_KW):
+    if _has_kw(t, CORVIN_KW):
         return "persona:corvin", "corvin"
-    if any(p in t for p in LIN_KW):
+    if _has_kw(t, LIN_KW):
         return "persona:lin", "lin"
 
     # режимы
-    if any(p in t for p in DIAGNOSTIC_KW):
+    if _has_kw(t, DIAGNOSTIC_KW):
         return "diagnostic", ""
-    if any(p in t for p in REVIEW_KW):
+    if _has_kw(t, REVIEW_KW):
         return "review", ""
-    if any(p in t for p in CASE_KW):
+    if _has_kw(t, CASE_KW):
         return "case", ""
-    if any(p in t for p in OSCE_KW):
+    if _has_kw(t, OSCE_KW):
         return "osce", ""
-    if any(p in t for p in IMAGING_KW):
+    if _has_kw(t, IMAGING_KW):
         return "imaging", ""
-    if any(p in t for p in NEW_KW):
+    if _has_kw(t, NEW_KW):
         return "new", ""
 
     return "", ""   # продолжить текущий mode (empty = keep)
@@ -242,17 +258,35 @@ if TELEGRAM_USER:
     TELEGRAM_USER = str(TELEGRAM_USER).lstrip("@")
 
 
+def esc(text: object) -> str:
+    """Экранировать динамический (LLM/пользовательский) текст для HTML-режима.
+
+    Telegram с parse_mode=HTML отклоняет «голые» <, >, & — ответ модели вроде
+    «ВЧД < 20» или «a&b» раньше валил весь sendMessage 400-й ошибкой, и фидбек
+    терялся МОЛЧА. Экранируем только подставляемый контент; наши собственные
+    теги-шаблоны (<b>, <i>) добавляются ВОКРУГ уже экранированного текста и
+    остаются рабочей разметкой. quote=False — кавычки в тексте не трогаем.
+    """
+    return html.escape(str(text if text is not None else ""), quote=False)
+
+
 def send_telegram(text: str, disable_notification: bool = False,
                   reply_markup: dict | None = None) -> int | None:
     """Отправить сообщение пользователю через Telegram Bot API.
 
     Возвращает message_id отправленного сообщения (truthy при успехе) или
     None при ошибке. message_id нужен, чтобы привязать ответ-reply ученика к
-    КОНКРЕТНОМУ вопросу (см. reply-привязку в handle_message)."""
+    КОНКРЕТНОМУ вопросу (см. reply-привязку в handle_message).
+
+    Если HTML-разметка не распарсилась (битая сущность в неэкранированном
+    фрагменте), сообщение НЕ теряется: повторяем отправку как обычный текст
+    без parse_mode. Доставка важнее форматирования — это страховка от
+    «бот молчит» на любом не пойманном экранированием месте."""
     if not TELEGRAM_TOKEN:
         log.warning("TELEGRAM_BOT_TOKEN не задан, пропускаю отправку")
         return None
     user = TELEGRAM_USER or os.getenv("TELEGRAM_USER_ID", "")
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id":    user,
         "text":       text,
@@ -262,16 +296,23 @@ def send_telegram(text: str, disable_notification: bool = False,
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json=payload,
-            timeout=10,
-        )
+        r = requests.post(url, json=payload, timeout=10)
         data = r.json()
-        if not data.get("ok"):
-            log.error("telegram send failed: %s", r.text)
-            return None
-        return data.get("result", {}).get("message_id")
+        if data.get("ok"):
+            return data.get("result", {}).get("message_id")
+        log.error("telegram send failed: %s", r.text)
+        # Падение HTML-парсера (400) → пересылаем без разметки, чтобы не потерять
+        # сообщение. Тегов-шаблонов немного, но в plain-тексте они станут видимы
+        # буквально — это приемлемая деградация против немой потери фидбека.
+        if payload.get("parse_mode"):
+            payload.pop("parse_mode", None)
+            r2 = requests.post(url, json=payload, timeout=10)
+            d2 = r2.json()
+            if d2.get("ok"):
+                log.warning("telegram: пересылка без parse_mode удалась")
+                return d2.get("result", {}).get("message_id")
+            log.error("telegram plain resend failed: %s", r2.text)
+        return None
     except Exception:
         log.exception("telegram send error")
         return None
@@ -285,17 +326,30 @@ def send_telegram_document(filename: str, content: "str | bytes",
         return False
     user = TELEGRAM_USER or os.getenv("TELEGRAM_USER_ID", "")
     blob = content.encode("utf-8") if isinstance(content, str) else content
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+
+    def _post(use_html: bool) -> requests.Response:
+        data = {"chat_id": user, "caption": caption[:1024],
+                "disable_notification": "true"}
+        if use_html:
+            data["parse_mode"] = "HTML"
+        return requests.post(
+            url, data=data,
+            files={"document": (filename, blob, mime)}, timeout=60)
+
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
-            data={"chat_id": user, "caption": caption[:1024],
-                  "parse_mode": "HTML", "disable_notification": "true"},
-            files={"document": (filename, blob, mime)},
-            timeout=60,
-        )
-        ok = r.json().get("ok", False)
-        if not ok:
-            log.error("telegram sendDocument failed: %s", r.text)
+        r = _post(use_html=True)
+        if r.json().get("ok", False):
+            return True
+        # Битая HTML-сущность в caption → шлём документ без parse_mode, чтобы
+        # сам файл (конспект/алгоритм) точно дошёл.
+        log.error("telegram sendDocument failed: %s", r.text)
+        r2 = _post(use_html=False)
+        ok = r2.json().get("ok", False)
+        if ok:
+            log.warning("telegram sendDocument: отправка без parse_mode удалась")
+        else:
+            log.error("telegram sendDocument plain failed: %s", r2.text)
         return ok
     except Exception:
         log.exception("telegram sendDocument error")
@@ -324,7 +378,7 @@ def send_theory(topic: str, *, question: str = "", answer: str = "") -> bool:
         return False
 
     base = _safe_filename(topic)
-    caption = f"📘 Конспект по теме: <b>{topic}</b>"
+    caption = f"📘 Конспект по теме: <b>{esc(topic)}</b>"
     try:
         from neurotutor.render import markdown_to_pdf
         pdf = markdown_to_pdf(md, title=topic)
@@ -355,7 +409,7 @@ def send_algorithm(topic: str, *, kind: str = "", question: str = "",
         return False
 
     base = _safe_filename(topic)
-    caption = f"📐 Эталонный алгоритм: <b>{topic}</b>"
+    caption = f"📐 Эталонный алгоритм: <b>{esc(topic)}</b>"
     try:
         from neurotutor.render import markdown_to_pdf
         pdf = markdown_to_pdf(md, title=topic)
@@ -437,7 +491,7 @@ def _format_question(q: dict, queue_total: int | None = None) -> str:
     else:
         foot = ("<i>Ответь текстом — я оценю. Если вопросов несколько — "
                 "ответь <b>reply</b> на нужный, чтобы оценил именно его.</i>")
-    return f"{head}\n\n{q['prompt']}\n\n{foot}"
+    return f"{head}\n\n{esc(q['prompt'])}\n\n{foot}"
 
 
 def _send_next_question(user_id: str | int) -> bool:
@@ -509,15 +563,39 @@ CONSPECT_RE = re.compile(
 
 # грубый инференс домена по ключевым словам — чтобы изученный конспектом топик
 # попал в нужный срез карты компетенций (расширяет граф за пределы seed).
+# Коды строго из db.store.DOMAINS (14 разделов A–M + approaches): ретированные
+# pathology/clinical больше не существуют — топик с таким кодом не зарегистрировался
+# бы (get_or_create_concept вернул бы None). Порядок: от частного к общему,
+# первое совпадение выигрывает; дефолт — anatomy (базовые нейронауки, §A).
 _DOMAIN_HINTS = [
-    ("approaches", ("доступ", "краниотом", "резекц", "клипир", "операц",
-                    "шунт", "эндоскоп", "трепанац")),
+    ("vascular", ("аневризм", "авм ", "артериовеноз", "мальформац", "инсульт",
+                  "ишеми", "кровоизлия", "сосуд", "каротид", "стеноз сонн",
+                  "окклюз", "эмбол", "каверном", "сак", "субарахн")),
+    ("hydrocephalus", ("гидроцефал", "ликвор", "вентрикул", "шунт", "etv",
+                       "третья вентрикулост")),
+    ("spine", ("позвоночник", "спинальн", "спинного", "миелопат", "грыж диск",
+               "межпозвон", "спондил", "люмбаль", "цервикальн", "дискэктом")),
+    ("trauma", ("травма", "чмт", "гематом", "ушиб мозг", "перелом", "контузи",
+                "субдураль", "эпидураль")),
+    ("oncology", ("опухол", "глиом", "глиобластом", "менингиом", "аденом",
+                  "невринома", "шваннома", "гипофиз", "who", "карцином",
+                  "метастаз", "астроцитом", "эпендимом", "основани черепа")),
+    ("functional", ("эпилепси", "паркинсон", "dbs", "глубок стимул", "тригеминал",
+                    "невралги", "спастичн", "болев синдром", "функциональн")),
+    ("pediatric", ("детск", "педиатр", "врожд", "spina bifida", "дизрафи",
+                   "краниосиностоз")),
+    ("peripheral_nerve", ("периферическ нерв", "карпальн", "туннельн синдром",
+                          "сплетени", "плексус", "седалищн", "локтев нерв")),
+    ("infection", ("инфекц", "абсцесс", "менингит", "эмпиема", "остеомиелит",
+                   "энцефалит", "воспалит")),
+    ("neurocritical", ("реанимац", "интенсивн терап", "мониторинг", "внутричерепн",
+                       "вчд", "анестези", "наркоз", "седаци", "кризис")),
     ("radiology", ("кт", "мрт", "ангио", "снимок", "визуализац", "dwi",
-                   "flair", "перфузи", "трактограф")),
-    ("pathology", ("опухол", "глиом", "менингиом", "патолог", "гистолог",
-                   "who", "карцином", "метастаз")),
+                   "flair", "перфузи", "трактограф", "нейровизуал")),
+    ("approaches", ("доступ", "краниотом", "резекц", "клипир", "операц",
+                    "эндоскоп", "трепанац", "оперативн техник")),
     ("anatomy", ("анатом", "цистерн", "тракт", "ядро", "извилин", "артери",
-                 "вена", "нерв", "сплетени")),
+                 "вена", "нерв", "сплетени", "физиолог", "патофизиолог")),
 ]
 
 
@@ -526,7 +604,7 @@ def _infer_domain(topic: str) -> str:
     for domain, words in _DOMAIN_HINTS:
         if any(w in t for w in words):
             return domain
-    return "clinical"
+    return "anatomy"
 
 
 def send_mode_menu() -> None:
@@ -628,6 +706,34 @@ def send_reminder() -> None:
     _send_next_question(uid)
 
 
+def send_regrade() -> None:
+    """Переоценить ответы, отложенные из-за перегрузки MiniMax (529), и прислать
+    результаты. Бэкстоп замкнутой петли: оценка, упавшая на перегрузе, не
+    теряется — только откладывается до восстановления сервиса.
+
+    Молчит, если отложенных ответов нет.
+    """
+    uid = TELEGRAM_USER or os.getenv("TELEGRAM_USER_ID", "")
+    if not uid:
+        return
+    pend = drill.pending_regrade(str(uid))
+    if not pend:
+        log.info("regrade: отложенных ответов нет, молчу")
+        return
+    log.info("regrade: переоцениваю %d отложенн(ых) ответ(а)", len(pend))
+    try:
+        results = drill.regrade_saved(str(uid))
+    except Exception:
+        log.exception("regrade pass failed")
+        return
+    # Доставляем фидбек без авто-выдачи следующего вопроса (чтобы пакет не сыпал
+    # вопросами); один следующий открытый вопрос отправим в конце.
+    for fb in results:
+        _deliver_feedback(str(uid), fb, advance=False)
+    if results:
+        _send_next_question(uid)
+
+
 def send_digest(days: int = 14) -> None:
     """Собрать PubMed-дайджест и отправить в Telegram. Для крона/ручного запуска."""
     from neurotutor.digest import build_digest
@@ -697,7 +803,71 @@ def _question_quote(fb: dict) -> str:
         return ""
     if len(q_txt) > 90:
         q_txt = q_txt[:90].rstrip() + "…"
-    return f"📝 <i>Оценка по вопросу:</i> «{q_txt}»\n\n"
+    return f"📝 <i>Оценка по вопросу:</i> «{esc(q_txt)}»\n\n"
+
+
+def _deliver_feedback(user_id: str, fb: dict, *, advance: bool = True) -> None:
+    """Доставить результат оценки одного ответа: текст оценки, раскрытие
+    диагноза для кейса, ремедиацию при слабом ответе, следующий вопрос.
+
+    advance=False — только фидбек, без выдачи следующего вопроса (используется
+    при пакетной переоценке отложенных ответов, чтобы не сыпать вопросами).
+    """
+    quote = _question_quote(fb)
+
+    # Сервис оценки был перегружен (529): ответ сохранён, вопрос остался за
+    # учеником, переоценим автоматически. Никакой немой потери.
+    if fb.get("degraded"):
+        send_telegram(
+            quote + "⏳ Сервис оценки сейчас перегружен. Твой ответ "
+            "<b>сохранён</b> — оценю автоматически, как только отпустит. "
+            "Вопрос пока остаётся открытым.")
+        return
+
+    # Грейдер не смог разобрать ответ — вопрос остался открытым, просим повторить.
+    if fb.get("ungraded"):
+        send_telegram(quote + "⚠️ Не смог корректно оценить ответ (сбой "
+                      "парсинга). Вопрос остался открытым — попробуй "
+                      "переформулировать.")
+        if advance:
+            _send_next_question(user_id)
+        return
+
+    answer = fb.get("answer", "")
+    score = fb.get("score")
+    pct = f"{round((score or 0) * 100)}%"
+    mark = "✅" if (score or 0) >= 0.7 else ("🟡" if (score or 0) >= 0.4 else "❌")
+    tail = ("\n\n<i>Следующее повторение запланировано.</i>"
+            if fb.get("next_review") else "")
+    msg = (f"{quote}{mark} <b>Оценка: {pct}</b>\n\n"
+           f"{esc(fb.get('feedback', '').strip())}{tail}")
+    send_telegram(msg)
+
+    # Кейс: диагноз скрывался в вопросе — теперь, после ответа, раскрываем его.
+    if fb.get("kind") == "case" and fb.get("topic"):
+        send_telegram(f"🩺 Правильный диагноз: <b>{esc(fb['topic'])}</b>",
+                      disable_notification=True)
+
+    # Слабо справился → ремедиация зависит от режима:
+    #   алгоритм (ход операции/экстренный/кризис) → эталонный алгоритм;
+    #   тест/кейс → структурированный конспект из RAG.
+    if (score or 0) < THEORY_THRESHOLD and fb.get("topic"):
+        if fb.get("kind") in ALGO_KINDS:
+            send_telegram("📐 Покажу эталонный алгоритм по этой теме…",
+                          disable_notification=True)
+            send_algorithm(fb["topic"], kind=fb["kind"],
+                           question=fb.get("question", ""), answer=answer)
+        else:
+            send_telegram("📘 Подтяну теорию по этой теме — собираю конспект…",
+                          disable_notification=True)
+            send_theory(fb["topic"], question=fb.get("question", ""), answer=answer)
+
+    if not advance:
+        return
+    if fb.get("remaining"):
+        _send_next_question(user_id)
+    else:
+        send_telegram("🎉 Все вопросы дня закрыты. Отличная работа!")
 
 
 def _handle_drill_answer(user_id: str, text: str, qid: int | None = None) -> None:
@@ -712,48 +882,7 @@ def _handle_drill_answer(user_id: str, text: str, qid: int | None = None) -> Non
         fb = drill.answer_pending(user_id, text)
     if fb is None:
         return
-
-    quote = _question_quote(fb)
-
-    # Грейдер не смог разобрать ответ — вопрос остался открытым, просим повторить.
-    if fb.get("ungraded"):
-        send_telegram(quote + "⚠️ Не смог корректно оценить ответ (сбой "
-                      "парсинга). Вопрос остался открытым — попробуй "
-                      "переформулировать.")
-        _send_next_question(user_id)
-        return
-
-    score = fb.get("score")
-    pct = f"{round((score or 0) * 100)}%"
-    mark = "✅" if (score or 0) >= 0.7 else ("🟡" if (score or 0) >= 0.4 else "❌")
-    tail = ("\n\n<i>Следующее повторение запланировано.</i>"
-            if fb.get("next_review") else "")
-    msg = f"{quote}{mark} <b>Оценка: {pct}</b>\n\n{fb.get('feedback','').strip()}{tail}"
-    send_telegram(msg)
-
-    # Кейс: диагноз скрывался в вопросе — теперь, после ответа, раскрываем его.
-    if fb.get("kind") == "case" and fb.get("topic"):
-        send_telegram(f"🩺 Правильный диагноз: <b>{fb['topic']}</b>",
-                      disable_notification=True)
-
-    # Слабо справился → ремедиация зависит от режима:
-    #   алгоритм (ход операции/экстренный/кризис) → эталонный алгоритм;
-    #   тест/кейс → структурированный конспект из RAG.
-    if (score or 0) < THEORY_THRESHOLD and fb.get("topic"):
-        if fb.get("kind") in ALGO_KINDS:
-            send_telegram("📐 Покажу эталонный алгоритм по этой теме…",
-                          disable_notification=True)
-            send_algorithm(fb["topic"], kind=fb["kind"],
-                           question=fb.get("question", ""), answer=text)
-        else:
-            send_telegram("📘 Подтяну теорию по этой теме — собираю конспект…",
-                          disable_notification=True)
-            send_theory(fb["topic"], question=fb.get("question", ""), answer=text)
-
-    if fb.get("remaining"):
-        _send_next_question(user_id)
-    else:
-        send_telegram("🎉 Все вопросы дня закрыты. Отличная работа!")
+    _deliver_feedback(user_id, fb)
 
 
 def handle_message(raw: dict, user_id: str | int) -> None:
@@ -861,8 +990,8 @@ def handle_message(raw: dict, user_id: str | int) -> None:
             send_telegram("📘 По какой теме собрать конспект? Напиши, например: "
                           "«конспект по аневризмам ПСА».")
             return
-        send_telegram(f"📘 Собираю конспект по теме «<b>{topic}</b>» из учебников… "
-                      "(полминуты)", disable_notification=True)
+        send_telegram(f"📘 Собираю конспект по теме «<b>{esc(topic)}</b>» из "
+                      "учебников… (полминуты)", disable_notification=True)
         if not send_theory(topic):
             send_telegram("Не получилось собрать конспект — уточни тему?")
             return
@@ -916,7 +1045,7 @@ def handle_message(raw: dict, user_id: str | int) -> None:
                 # Кнопка финала висит на КАЖДОМ шаге разбора: оценку можно
                 # запустить в один тап, не угадывая слово-триггер.
                 send_telegram(
-                    body + "\n\n<i>Готов? Жми «✅ Заключение» или напиши "
+                    esc(body) + "\n\n<i>Готов? Жми «✅ Заключение» или напиши "
                     "«заключение: …».</i>",
                     reply_markup=CASE_FINAL_BTN)
                 return
@@ -949,7 +1078,7 @@ def handle_message(raw: dict, user_id: str | int) -> None:
 
     save_session(user_id, state)
 
-    send_telegram(reply_text)
+    send_telegram(esc(reply_text))
 
 
 def main() -> None:
@@ -1033,6 +1162,8 @@ if __name__ == "__main__":
         send_report()
     elif arg == "--remind":
         send_reminder()
+    elif arg == "--regrade":
+        send_regrade()
     elif arg == "--menu":
         send_mode_menu()
     elif arg == "--theory":

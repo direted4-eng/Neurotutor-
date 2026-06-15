@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS cases (
     plan            TEXT,                         -- JSON: management steps
     complications   TEXT,                         -- JSON list
     rubric          TEXT,                         -- JSON: OSCE-style grading
-    concept_ids     TEXT                          -- JSON list of concept refs
+    concept_ids     TEXT,                         -- JSON list of concept refs
+    sources         TEXT                          -- JSON: textbook refs the case was built from
 );
 
 CREATE TABLE IF NOT EXISTS images (
@@ -128,7 +129,9 @@ CREATE TABLE IF NOT EXISTS pending_questions (
     kind        TEXT NOT NULL DEFAULT 'recall',    -- recall|case|surgical_steps|emergency|crisis
     topic       TEXT,                              -- subject label (for remedial theory)
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    answered_at TIMESTAMP
+    answered_at TIMESTAMP,
+    expired_at  TIMESTAMP,                          -- TTL: set when the question went stale unanswered
+    saved_answer TEXT                               -- answer kept for re-grade when MiniMax was overloaded (529)
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_user ON pending_questions(user_id, answered_at);

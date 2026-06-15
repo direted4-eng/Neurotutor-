@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
+import random
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
 import httpx
 
 from ..config import SETTINGS
+
+log = logging.getLogger(__name__)
+
+# Transient statuses worth retrying. 529 = MiniMax "server overloaded" (the
+# common one); the rest are standard rate-limit / gateway hiccups. Hermes
+# survives on the very same endpoint because it retries — so do we.
+_RETRY_STATUS = {429, 500, 502, 503, 504, 529}
+_MAX_ATTEMPTS = 4
 
 
 class MiniMaxClient:
@@ -37,6 +48,39 @@ class MiniMaxClient:
     def close(self) -> None:
         self._client.close()
 
+    def _post(self, path: str, payload: dict) -> httpx.Response:
+        """POST with exponential backoff on transient overload (529) / 5xx /
+        timeouts. Raises the last error if every attempt fails."""
+        last_exc: Exception | None = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                r = self._client.post(
+                    path, json=payload, params=self._params or None
+                )
+                if r.status_code in _RETRY_STATUS:
+                    raise httpx.HTTPStatusError(
+                        f"transient {r.status_code}", request=r.request, response=r
+                    )
+                r.raise_for_status()
+                return r
+            except (httpx.HTTPStatusError, httpx.TransportError, httpx.TimeoutException) as exc:
+                # Non-retryable HTTP errors (e.g. 4xx other than 429) fail fast.
+                if isinstance(exc, httpx.HTTPStatusError) and \
+                        exc.response.status_code not in _RETRY_STATUS:
+                    raise
+                last_exc = exc
+                if attempt == _MAX_ATTEMPTS:
+                    break
+                # 1s, 2s, 4s + jitter — gives MiniMax time to drain its queue.
+                delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                log.warning(
+                    "MiniMax %s attempt %d/%d failed (%s); retrying in %.1fs",
+                    path, attempt, _MAX_ATTEMPTS, exc.__class__.__name__, delay,
+                )
+                time.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
+
     def chat(
         self,
         messages: list[dict],
@@ -53,11 +97,7 @@ class MiniMaxClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        r = self._client.post(
-            "/text/chatcompletion_v2", json=payload, params=self._params or None
-        )
-        r.raise_for_status()
-        return r.json()
+        return self._post("/text/chatcompletion_v2", payload).json()
 
     def vision_chat(
         self,
@@ -97,17 +137,14 @@ class MiniMaxClient:
         passages, type_='query' when embedding user queries. Mixing types
         silently degrades cosine similarity.
         """
-        r = self._client.post(
+        data = self._post(
             "/embeddings",
-            json={
+            {
                 "model": SETTINGS.embed_model,
                 "texts": list(texts),
                 "type": type_,
             },
-            params=self._params or None,
-        )
-        r.raise_for_status()
-        data = r.json()
+        ).json()
         return data.get("vectors") or data.get("data") or []
 
 

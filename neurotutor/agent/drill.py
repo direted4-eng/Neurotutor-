@@ -459,11 +459,23 @@ def generate_one(user_id: str, kind: str) -> dict | None:
 STALE_HOURS = 48
 
 
-def _ensure_expired_column() -> None:
-    """Idempotent migration: add pending_questions.expired_at / tg_message_id."""
+def _ensure_pending_columns() -> None:
+    """Idempotent migration: add pending_questions columns missing on old DBs
+    (expired_at / tg_message_id / saved_answer).
+
+    Self-heals a brand-new DB: if the table doesn't exist yet (fresh deploy,
+    schema never applied), build the schema first — schema.sql already declares
+    every column, so no ALTERs are then needed. Without this, importing this
+    module against an empty DB used to crash on the first ALTER.
+    """
     with connect() as conn:
         cols = [r[1] for r in conn.execute(
             "PRAGMA table_info(pending_questions)").fetchall()]
+    if not cols:
+        from ..db.store import init_db
+        init_db()
+        return
+    with connect() as conn:
         if "expired_at" not in cols:
             conn.execute(
                 "ALTER TABLE pending_questions ADD COLUMN expired_at TIMESTAMP")
@@ -473,9 +485,15 @@ def _ensure_expired_column() -> None:
             # it replies to — instead of always grading the oldest open one.
             conn.execute(
                 "ALTER TABLE pending_questions ADD COLUMN tg_message_id INTEGER")
+        if "saved_answer" not in cols:
+            # The resident's answer, stashed when MiniMax was overloaded (529)
+            # and grading had to be deferred. A re-grade pass picks these up so
+            # an overload never silently swallows an answer.
+            conn.execute(
+                "ALTER TABLE pending_questions ADD COLUMN saved_answer TEXT")
 
 
-_ensure_expired_column()
+_ensure_pending_columns()
 
 
 def set_question_message(qid: int, tg_message_id: int | None) -> None:
@@ -655,6 +673,43 @@ def answer_specific(user_id: str, qid: int, answer: str) -> dict | None:
     return _grade_pending_row(user_id, row, answer)
 
 
+def pending_regrade(user_id: str) -> list[dict]:
+    """Open questions whose answer was stashed during a MiniMax overload (529).
+
+    These are answered-but-ungraded: the resident replied, but the grader was
+    down, so we kept the text in saved_answer instead of losing it.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT id FROM pending_questions
+               WHERE user_id=? AND answered_at IS NULL AND expired_at IS NULL
+                 AND saved_answer IS NOT NULL
+               ORDER BY created_at ASC""",
+            (user_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def regrade_saved(user_id: str) -> list[dict]:
+    """Re-grade every answer deferred by an overload. Returns feedback dicts.
+
+    Each still-degraded result (MiniMax still down) is skipped — its saved_answer
+    stays put so the next pass retries. Successfully graded ones flow through the
+    normal grade→FSRS→responses pipeline and clear their saved_answer.
+    """
+    out: list[dict] = []
+    for ref in pending_regrade(user_id):
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_questions WHERE id=?", (ref["id"],)
+            ).fetchone()
+        if not row or row["saved_answer"] is None:
+            continue
+        fb = _grade_pending_row(user_id, row, row["saved_answer"])
+        if fb and not fb.get("degraded"):
+            out.append(fb)
+    return out
+
+
 def _grade_pending_row(user_id: str, row, answer: str) -> dict | None:
     """Grade one pending-question row, reschedule (FSRS), persist the response.
 
@@ -670,11 +725,26 @@ def _grade_pending_row(user_id: str, row, answer: str) -> dict | None:
         grade_prompt += (
             f"\n\n[Для проверяющего, студенту НЕ показано — эталонный диагноз: "
             f"{row['topic']}. Оцени, насколько ответ к нему близок.]")
-    g = grade_answer(
-        prompt=grade_prompt, answer=answer,
-        concept_id=row["concept_id"], bloom_level=row["bloom_level"],
-        rubric={"criteria": rubric} if rubric else None,
-    )
+    # MiniMax-only: there is no failover model. If the grader call exhausts its
+    # retries (persistent 529 / network), DON'T let the exception bubble up and
+    # vanish the answer in main()'s catch-all. Stash the answer, keep the
+    # question open, and signal a graceful degrade — the --regrade pass will
+    # grade it once MiniMax recovers.
+    try:
+        g = grade_answer(
+            prompt=grade_prompt, answer=answer,
+            concept_id=row["concept_id"], bloom_level=row["bloom_level"],
+            rubric={"criteria": rubric} if rubric else None,
+        )
+    except Exception:
+        log.exception("grade_answer failed (overload?) for pending %s — deferring",
+                      row["id"])
+        with connect() as conn:
+            conn.execute(
+                "UPDATE pending_questions SET saved_answer=? WHERE id=?",
+                (answer, row["id"]))
+        return {"degraded": True, "kind": row["kind"], "topic": row["topic"],
+                "question": row["prompt"]}
 
     # Grader couldn't be parsed → leave the question OPEN and don't touch FSRS,
     # so a transient hiccup never writes a phantom lapse into the mastery map.
@@ -705,8 +775,11 @@ def _grade_pending_row(user_id: str, row, answer: str) -> dict | None:
              json.dumps(g.get("breakdown"), ensure_ascii=False)
              if g.get("breakdown") is not None else None),
         )
-        conn.execute("UPDATE pending_questions SET answered_at=? WHERE id=?",
-                     (now, row["id"]))
+        # Clear any stashed answer from an earlier deferred (529) attempt — this
+        # row is now graded for real.
+        conn.execute(
+            "UPDATE pending_questions SET answered_at=?, saved_answer=NULL "
+            "WHERE id=?", (now, row["id"]))
 
     # Refresh the dashboard snapshot now that mastery moved (best-effort — a
     # missing static dir or any failure must never break grading).
@@ -727,4 +800,5 @@ def _grade_pending_row(user_id: str, row, answer: str) -> dict | None:
         "kind": row["kind"],
         "topic": row["topic"],
         "question": row["prompt"],
+        "answer": answer,
     }
